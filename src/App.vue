@@ -1,83 +1,59 @@
 <script setup lang="ts">
-import { Monitor, Folder } from '@element-plus/icons-vue'
+// 应用根组件 —— 负责 Naive UI 全局 Provider 编排 + 布局壳挂载。
+//
+// Naive UI 要求 n-message-provider / n-dialog-provider 等必须是组件树祖先，
+// 才能让后代组件通过 useMessage() / useDialog() 取到上下文。
+// 因此 Provider 包在最外层（App.vue），布局壳 AppShell 放在其内部。
+
+import { computed } from 'vue'
+import {
+  NConfigProvider,
+  NMessageProvider,
+  NDialogProvider,
+  NLoadingBarProvider,
+  zhCN,
+  dateZhCN,
+  type GlobalThemeOverrides,
+} from 'naive-ui'
+import { useThemeStore } from '@/stores/theme'
+import AppShell from '@/components/layout/AppShell.vue'
+
+const themeStore = useThemeStore()
+
+/** 全局主题覆盖：统一品牌强调色、圆角、紧凑度，贴合桌面软件 */
+const themeOverrides = computed<GlobalThemeOverrides>(() => ({
+  common: {
+    primaryColor: '#1890ff',
+    primaryColorHover: '#40a9ff',
+    primaryColorPressed: '#096dd9',
+    primaryColorSuppl: '#1890ff',
+    borderRadius: '5px',
+    borderRadiusSmall: '4px',
+    fontFamily:
+      "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'PingFang SC', 'Microsoft YaHei', sans-serif",
+    fontSize: '13px',
+  },
+  Button: {
+    fontWeight: '400',
+  },
+}))
 </script>
 
 <template>
-  <el-container class="app-container">
-    <el-aside width="200px" class="app-aside">
-      <div class="logo">
-        <span>DevLauncher</span>
-      </div>
-      <el-menu
-        :default-active="$route.path"
-        router
-        class="app-menu"
-      >
-        <el-menu-item index="/projects">
-          <el-icon><Monitor /></el-icon>
-          <span>项目列表</span>
-        </el-menu-item>
-        <el-menu-item index="/groups">
-          <el-icon><Folder /></el-icon>
-          <span>分组管理</span>
-        </el-menu-item>
-      </el-menu>
-    </el-aside>
-
-    <el-container>
-      <el-header class="app-header">
-        <span class="header-title">DevLauncher — 开发机项目管理器</span>
-      </el-header>
-      <el-main class="app-main">
-        <router-view />
-      </el-main>
-    </el-container>
-  </el-container>
+  <NConfigProvider
+    :theme="themeStore.naiveTheme"
+    :theme-overrides="themeOverrides"
+    :locale="zhCN"
+    :date-locale="dateZhCN"
+  >
+    <NLoadingBarProvider>
+      <NDialogProvider>
+        <NMessageProvider>
+          <AppShell>
+            <RouterView />
+          </AppShell>
+        </NMessageProvider>
+      </NDialogProvider>
+    </NLoadingBarProvider>
+  </NConfigProvider>
 </template>
-
-<style scoped>
-.app-container {
-  height: 100vh;
-}
-
-.app-aside {
-  background: #001529;
-  display: flex;
-  flex-direction: column;
-}
-
-.logo {
-  height: 60px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: #fff;
-  font-size: 20px;
-  font-weight: bold;
-  border-bottom: 1px solid #1f1f1f;
-}
-
-.app-menu {
-  flex: 1;
-  border-right: none;
-  background: transparent;
-}
-
-.app-header {
-  display: flex;
-  align-items: center;
-  border-bottom: 1px solid #e8e8e8;
-  background: #fff;
-}
-
-.header-title {
-  font-size: 16px;
-  font-weight: 600;
-  color: #333;
-}
-
-.app-main {
-  background: #f5f5f5;
-  padding: 20px;
-}
-</style>

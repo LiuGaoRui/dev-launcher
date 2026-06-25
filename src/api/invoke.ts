@@ -12,7 +12,7 @@ import { invoke, type InvokeArgs } from '@tauri-apps/api/core'
  * 类型化 invoke 包装。
  *
  * Tauri reject 抛出的是 Error，message 为后端 AppError 的 to_string()。
- * 直接透传；调用方用 try/catch 或 .catch 处理并展示 ElMessage。
+ * 直接透传；调用方用 try/catch 或 .catch 处理并展示错误提示。
  */
 export function invokeCmd<T>(cmd: string, args?: InvokeArgs): Promise<T> {
   return invoke<T>(cmd, args)

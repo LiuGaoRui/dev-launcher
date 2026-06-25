@@ -1,0 +1,108 @@
+/* ===========================================================================
+ * 全局设计 token —— 非 Naive UI 组件使用的语义 CSS 变量
+ *
+ * Naive UI 组件自身的主题由 n-config-provider 的 theme/theme-overrides 驱动，
+ * 此文件仅覆盖：自定义标题栏、侧边栏、状态栏、终端日志区、状态色条等
+ * 原生 div/pre 结构。所有变量在浅色（默认）与深色（[data-theme="dark"]）下两套。
+ * ======================================================================== */
+
+:root {
+  /* ---- 窗口结构背景 ---- */
+  --titlebar-bg: #ececec; /* 标题栏：macOS 风浅灰 */
+  --titlebar-fg: #303133; /* 标题栏文字 */
+  --titlebar-btn-hover: rgba(0, 0, 0, 0.08);
+  --titlebar-close-hover: #e81123; /* 关闭键 hover 红 */
+  --titlebar-close-fg: #fff;
+
+  --sidebar-bg: #f7f7f7; /* 侧边栏底色 */
+  --sidebar-fg: #4b4b4b;
+  --sidebar-active-bg: rgba(24, 144, 255, 0.12);
+  --sidebar-active-fg: #1890ff;
+  --sidebar-hover-bg: rgba(0, 0, 0, 0.04);
+
+  --statusbar-bg: #ececec; /* 状态栏 */
+  --statusbar-fg: #666;
+
+  --content-bg: #f0f0f0; /* 主内容区背景 */
+  --card-bg: #ffffff; /* 卡片/面板底 */
+  --card-border: #e3e3e3;
+  --card-hover-border: #1890ff;
+  --card-hover-bg: #fafcff;
+
+  --toolbar-bg: #fafafa; /* 页内工具栏 */
+
+  /* ---- 文字层级 ---- */
+  --text-primary: #1f1f1f;
+  --text-secondary: #595959;
+  --text-tertiary: #8c8c8c;
+
+  /* ---- 状态色（项目健康） ---- */
+  --status-running: #52c41a;
+  --status-warning: #faad14;
+  --status-stopped: #bfbfbf;
+  --status-running-soft: rgba(82, 196, 26, 0.12);
+  --status-warning-soft: rgba(250, 173, 20, 0.14);
+  --status-stopped-soft: rgba(191, 191, 191, 0.14);
+
+  /* ---- 终端日志区 ---- */
+  --terminal-bg: #1e1e1e;
+  --terminal-fg: #d4d4d4;
+  --terminal-err: #f56c6c;
+  --terminal-dim: #888;
+  --terminal-info-bg: #fafafa;
+  --terminal-info-fg: #303133;
+
+  --accent: #1890ff; /* 品牌强调色 */
+
+  /* ---- 通用 ---- */
+  --divider: #e8e8e8;
+  --code-font: 'Cascadia Code', 'JetBrains Mono', Consolas, 'Courier New', monospace;
+}
+
+/* ============================== 深色主题 ============================== */
+[data-theme='dark'] {
+  --titlebar-bg: #1e1e1e;
+  --titlebar-fg: #d4d4d4;
+  --titlebar-btn-hover: rgba(255, 255, 255, 0.1);
+  --titlebar-close-hover: #e81123;
+  --titlebar-close-fg: #fff;
+
+  --sidebar-bg: #181818;
+  --sidebar-fg: #a0a0a0;
+  --sidebar-active-bg: rgba(24, 144, 255, 0.22);
+  --sidebar-active-fg: #40a9ff;
+  --sidebar-hover-bg: rgba(255, 255, 255, 0.06);
+
+  --statusbar-bg: #1e1e1e;
+  --statusbar-fg: #888;
+
+  --content-bg: #141414;
+  --card-bg: #1f1f1f;
+  --card-border: #2a2a2a;
+  --card-hover-border: #1890ff;
+  --card-hover-bg: #242424;
+
+  --toolbar-bg: #1a1a1a;
+
+  --text-primary: #e8e8e8;
+  --text-secondary: #a8a8a8;
+  --text-tertiary: #6a6a6a;
+
+  --status-running: #52c41a;
+  --status-warning: #faad14;
+  --status-stopped: #5a5a5a;
+  --status-running-soft: rgba(82, 196, 26, 0.18);
+  --status-warning-soft: rgba(250, 173, 20, 0.2);
+  --status-stopped-soft: rgba(120, 120, 120, 0.2);
+
+  --terminal-bg: #0d0d0d;
+  --terminal-fg: #d4d4d4;
+  --terminal-err: #ff6b6b;
+  --terminal-dim: #666;
+  --terminal-info-bg: #0d0d0d;
+  --terminal-info-fg: #d4d4d4;
+
+  --accent: #1890ff;
+
+  --divider: #2a2a2a;
+}

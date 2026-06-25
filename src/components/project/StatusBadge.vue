@@ -5,13 +5,14 @@
 // - running_abnormal：橙色 + 警告图标，tooltip 说明端口未就绪/被占用
 // - stopped：灰色
 import { computed } from 'vue'
-import { Warning } from '@element-plus/icons-vue'
+import { NTag, NIcon } from 'naive-ui'
+import { WarningOutline } from '@vicons/ionicons5'
 import { HEALTH_LABELS, type HealthStatus } from '@/types/monitor'
 
-const TAG_TYPE_MAP: Record<HealthStatus, 'success' | 'warning' | 'info'> = {
+const TAG_TYPE_MAP: Record<HealthStatus, 'success' | 'warning' | 'default'> = {
   running: 'success',
   running_abnormal: 'warning',
-  stopped: 'info',
+  stopped: 'default',
 }
 
 const props = defineProps<{
@@ -20,15 +21,17 @@ const props = defineProps<{
 
 const tagType = computed(() => TAG_TYPE_MAP[props.health])
 const isAbnormal = computed(() => props.health === 'running_abnormal')
-const isRunning = computed(() => tagType.value !== 'info')
+const isRunning = computed(() => tagType.value !== 'default')
 </script>
 
 <template>
-  <el-tag :type="tagType" effect="light" size="small" round>
+  <NTag :type="tagType" size="small" round :bordered="false">
+    <template #icon>
+      <NIcon v-if="isAbnormal"><WarningOutline /></NIcon>
+    </template>
     <span class="dot" :class="{ on: isRunning, warn: isAbnormal }" />
-    <el-icon v-if="isAbnormal" class="warn-icon"><Warning /></el-icon>
     {{ HEALTH_LABELS[props.health] }}
-  </el-tag>
+  </NTag>
 </template>
 
 <style scoped>
@@ -39,29 +42,15 @@ const isRunning = computed(() => tagType.value !== 'info')
   border-radius: 50%;
   margin-right: 4px;
   vertical-align: middle;
-  background: #909399;
+  background: var(--status-stopped);
 }
 .dot.on {
-  background: #67c23a;
-  box-shadow: 0 0 0 3px rgba(103, 194, 58, 0.2);
+  background: var(--status-running);
+  box-shadow: 0 0 0 3px var(--status-running-soft);
   animation: pulse 1.6s ease-in-out infinite;
 }
 .dot.warn {
-  background: #e6a23c;
-  box-shadow: 0 0 0 3px rgba(230, 162, 60, 0.2);
-}
-.warn-icon {
-  margin-right: 2px;
-  font-size: 12px;
-  vertical-align: middle;
-}
-@keyframes pulse {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.55;
-  }
+  background: var(--status-warning);
+  box-shadow: 0 0 0 3px var(--status-warning-soft);
 }
 </style>

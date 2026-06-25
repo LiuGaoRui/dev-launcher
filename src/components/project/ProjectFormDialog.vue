@@ -12,7 +12,18 @@
 
 import { computed, reactive, ref, watch } from 'vue'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
-import type { FormInstance, FormRules } from 'element-plus'
+import {
+  NModal,
+  NForm,
+  NFormItem,
+  NInput,
+  NInputGroup,
+  NSelect,
+  NSwitch,
+  NButton,
+  type FormInst,
+  type FormRules,
+} from 'naive-ui'
 import {
   PROJECT_TYPE_OPTIONS,
   type Project,
@@ -64,10 +75,18 @@ const EMPTY_FORM: FormState = {
 }
 
 const form = reactive<FormState>({ ...EMPTY_FORM })
-const formRef = ref<FormInstance>()
+const formRef = ref<FormInst | null>(null)
 
 const isEdit = computed(() => !!props.project)
 const title = computed(() => (isEdit.value ? '编辑项目' : '新建项目'))
+
+const visible = computed({
+  get: () => props.modelValue,
+  set: (v: boolean) => emit('update:modelValue', v),
+})
+
+// 分组下拉选项（含「不分组」空选项）
+const groupOptions = computed(() => props.groups.map((g) => ({ label: g.name, value: g.id })))
 
 // dialog 打开时同步表单
 watch(
@@ -88,13 +107,13 @@ watch(
       // 应用默认分组（如在分组 tab 内点新建）
       form.group_id = props.defaultGroupId ?? null
     }
-    formRef.value?.clearValidate()
+    formRef.value?.restoreValidation()
   },
 )
 
 // ===== 校验 =====
 
-const rules: FormRules<FormState> = {
+const rules: FormRules = {
   name: [{ required: true, message: '请输入项目名称', trigger: 'blur' }],
   type: [{ required: true, message: '请选择项目类型', trigger: 'change' }],
   path: [{ required: true, message: '请选择项目目录', trigger: 'change' }],
@@ -113,7 +132,8 @@ async function pickDirectory() {
     })
     if (typeof selected === 'string' && selected.length > 0) {
       form.path = selected
-      formRef.value?.validateField('path')
+      // 清除 path 字段可能的「请选择项目目录」校验错误
+      formRef.value?.restoreValidation()
     }
   } catch (e) {
     // 用户取消会 reject，忽略即可
@@ -143,118 +163,112 @@ function buildInput(): ProjectInput {
 
 async function handleSubmit() {
   if (!formRef.value) return
-  const valid = await formRef.value.validate().catch(() => false)
-  if (!valid) return
-  emit('submit', buildInput(), props.project ?? null)
+  await formRef.value.validate(async (errors) => {
+    if (errors) return
+    emit('submit', buildInput(), props.project ?? null)
+  })
 }
 
 function handleClose() {
-  emit('update:modelValue', false)
+  visible.value = false
 }
 </script>
 
 <template>
-  <el-dialog
-    :model-value="props.modelValue"
+  <NModal
+    v-model:show="visible"
+    preset="card"
     :title="title"
-    width="560px"
-    :close-on-click-modal="false"
-    append-to-body
-    @update:model-value="handleClose"
+    style="width: 560px"
+    :mask-closable="false"
   >
-    <el-form
+    <NForm
       ref="formRef"
       :model="form"
       :rules="rules"
-      label-width="88px"
-      label-position="right"
+      label-width="88"
+      label-placement="left"
+      require-mark-placement="right-hanging"
     >
-      <el-form-item label="项目名称" prop="name">
-        <el-input v-model="form.name" placeholder="如：HR后端" clearable />
-      </el-form-item>
+      <NFormItem label="项目名称" path="name">
+        <NInput v-model:value="form.name" placeholder="如：HR后端" clearable />
+      </NFormItem>
 
-      <el-form-item label="项目类型" prop="type">
-        <el-select v-model="form.type" placeholder="选择类型" style="width: 100%">
-          <el-option
-            v-for="opt in PROJECT_TYPE_OPTIONS"
-            :key="opt.value"
-            :label="opt.label"
-            :value="opt.value"
-          />
-        </el-select>
-      </el-form-item>
+      <NFormItem label="项目类型" path="type">
+        <NSelect v-model:value="form.type" :options="PROJECT_TYPE_OPTIONS" placeholder="选择类型" />
+      </NFormItem>
 
-      <el-form-item label="所属分组" prop="group_id">
-        <el-select
-          v-model="form.group_id"
+      <NFormItem label="所属分组" path="group_id">
+        <NSelect
+          v-model:value="form.group_id"
+          :options="groupOptions"
           placeholder="不分组"
           clearable
-          style="width: 100%"
-        >
-          <el-option
-            v-for="g in props.groups"
-            :key="g.id"
-            :label="g.name"
-            :value="g.id"
+        />
+      </NFormItem>
+
+      <NFormItem label="项目目录" path="path">
+        <NInputGroup>
+          <NInput
+            v-model:value="form.path"
+            placeholder="点击右侧按钮选择目录"
+            readonly
+            style="flex: 1"
           />
-        </el-select>
-      </el-form-item>
+          <NButton @click="pickDirectory">选择...</NButton>
+        </NInputGroup>
+      </NFormItem>
 
-      <el-form-item label="项目目录" prop="path">
-        <el-input v-model="form.path" placeholder="点击右侧按钮选择目录" readonly>
-          <template #append>
-            <el-button @click="pickDirectory">选择...</el-button>
-          </template>
-        </el-input>
-      </el-form-item>
-
-      <el-form-item label="启动命令" prop="start_cmd">
-        <el-input
-          v-model="form.start_cmd"
+      <NFormItem label="启动命令" path="start_cmd">
+        <NInput
+          v-model:value="form.start_cmd"
           placeholder="如：npm run dev / mvn spring-boot:run"
           clearable
         />
-      </el-form-item>
+      </NFormItem>
 
-      <el-form-item label="构建命令" prop="build_cmd">
-        <el-input
-          v-model="form.build_cmd"
+      <NFormItem label="构建命令" path="build_cmd">
+        <NInput
+          v-model:value="form.build_cmd"
           placeholder="可选，如：mvn clean package / npm run build"
           clearable
         />
-      </el-form-item>
+      </NFormItem>
 
-      <el-form-item label="预期端口" prop="expected_ports">
-        <el-input
-          v-model="form.expected_ports"
+      <NFormItem label="预期端口" path="expected_ports">
+        <NInput
+          v-model:value="form.expected_ports"
           placeholder="多个端口用逗号分隔，如：8080, 5173"
           clearable
         />
-      </el-form-item>
+      </NFormItem>
 
-      <el-form-item label="启用">
-        <el-switch v-model="form.enabled" />
+      <NFormItem label="启用">
+        <NSwitch v-model:value="form.enabled" />
         <span class="hint">关闭后该项目不在列表执行批量操作</span>
-      </el-form-item>
-    </el-form>
+      </NFormItem>
+    </NForm>
 
     <template #footer>
-      <el-button @click="handleClose">取消</el-button>
-      <el-button
-        type="primary"
-        :loading="props.submitting"
-        @click="handleSubmit"
-      >
-        {{ isEdit ? '保存' : '创建' }}
-      </el-button>
+      <div class="footer">
+        <NButton @click="handleClose">取消</NButton>
+        <NButton type="primary" :loading="props.submitting" @click="handleSubmit">
+          {{ isEdit ? '保存' : '创建' }}
+        </NButton>
+      </div>
     </template>
-  </el-dialog>
+  </NModal>
 </template>
 
 <style scoped>
 .hint {
   margin-left: 8px;
   font-size: 12px;
-  color: #909399;
+  color: var(--text-tertiary);
+}
+.footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 </style>

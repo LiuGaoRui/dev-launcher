@@ -1,5 +1,6 @@
 <script setup lang="ts">
 // 项目卡片底部的操作条。
+import { NButton } from 'naive-ui'
 // 阶段 3：启动 / 停止 / 重启 / 编辑 / 删除。
 // 阶段 7：新增 构建 / 发布（build_cmd 为空时禁用，前端无法感知 build_cmd，
 //          由父组件用 canBuild prop 控制可用性）。
@@ -25,61 +26,62 @@ const emit = defineEmits<{
 
 <template>
   <div class="action-bar">
-    <el-button
+    <NButton
       v-if="!running"
+      size="tiny"
       type="success"
-      size="small"
       :loading="busy"
       @click="emit('start')"
     >
       启动
-    </el-button>
-    <el-button
+    </NButton>
+    <NButton
       v-else
+      size="tiny"
       type="warning"
-      size="small"
       :loading="busy"
       @click="emit('stop')"
     >
       停止
-    </el-button>
-    <el-button size="small" :disabled="busy" @click="emit('restart')">重启</el-button>
-    <el-button
-      size="small"
+    </NButton>
+    <NButton size="tiny" tertiary :disabled="busy" @click="emit('restart')">重启</NButton>
+    <NButton
+      size="tiny"
+      tertiary
       :disabled="busy || !canBuild"
       :title="canBuild ? '执行构建命令' : '未配置构建命令'"
       @click="emit('build')"
     >
       构建
-    </el-button>
-    <el-button
-      size="small"
+    </NButton>
+    <NButton
+      size="tiny"
       type="primary"
-      plain
+      tertiary
       :disabled="busy || !canBuild"
       :title="canBuild ? '停止 → 构建 → 启动' : '未配置构建命令'"
       @click="emit('deploy')"
     >
       发布
-    </el-button>
-    <el-button size="small" :disabled="busy" text @click="emit('edit')">编辑</el-button>
-    <el-button
-      size="small"
-      type="danger"
-      text
+    </NButton>
+    <NButton size="tiny" quaternary :disabled="busy" @click="emit('edit')">编辑</NButton>
+    <NButton
+      size="tiny"
+      quaternary
+      type="error"
       :disabled="busy || running"
       :title="running ? '请先停止项目再删除' : '删除项目'"
       @click="emit('delete')"
     >
       删除
-    </el-button>
+    </NButton>
   </div>
 </template>
 
 <style scoped>
 .action-bar {
   display: flex;
-  gap: 8px;
+  gap: 6px;
   align-items: center;
   flex-wrap: wrap;
 }

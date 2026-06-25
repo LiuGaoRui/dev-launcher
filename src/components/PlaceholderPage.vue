@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { NEmpty } from 'naive-ui'
+
 defineProps<{
   description: string
 }>()
@@ -6,7 +8,7 @@ defineProps<{
 
 <template>
   <div class="placeholder">
-    <el-empty :description="description" />
+    <NEmpty :description="description" />
   </div>
 </template>
 

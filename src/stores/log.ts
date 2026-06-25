@@ -14,10 +14,12 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { Channel } from '@tauri-apps/api/core'
-import { ElMessage } from 'element-plus'
+import { createDiscreteApi } from 'naive-ui'
 import { subscribeLog, readLogHistory, listLogDates, clearLog } from '@/api/log'
 import type { LogChunk } from '@/types/log'
 import { safeCall } from '@/api/invoke'
+
+const { message } = createDiscreteApi(['message'])
 
 /** 历史分页单页字节上限（与后端 HISTORY_PAGE_LIMIT_MAX 对齐：256KB） */
 const HISTORY_PAGE_SIZE = 256 * 1024
@@ -71,7 +73,7 @@ export const useLogStore = defineStore('log', () => {
     const [, err] = await safeCall(() => subscribeLog(projectId, channel))
     loading.value = false
     if (err) {
-      ElMessage.error(`订阅实时日志失败：${err}`)
+      message.error(`订阅实时日志失败：${err}`)
       stopLive()
     }
   }
@@ -88,7 +90,7 @@ export const useLogStore = defineStore('log', () => {
   async function fetchDates(projectId: number) {
     const [list, err] = await safeCall(() => listLogDates(projectId))
     if (err) {
-      ElMessage.error(`读取日志日期失败：${err}`)
+      message.error(`读取日志日期失败：${err}`)
       return
     }
     dates.value = list ?? []
@@ -115,7 +117,7 @@ export const useLogStore = defineStore('log', () => {
     )
     loading.value = false
     if (err) {
-      ElMessage.error(`读取历史日志失败：${err}`)
+      message.error(`读取历史日志失败：${err}`)
       return
     }
     if (page) {
@@ -141,7 +143,7 @@ export const useLogStore = defineStore('log', () => {
   async function clear(projectId: number) {
     const [, err] = await safeCall(() => clearLog(projectId))
     if (err) {
-      ElMessage.error(`清空日志失败：${err}`)
+      message.error(`清空日志失败：${err}`)
       return false
     }
     // 清空按钮仅在 live 模式显示，同步清空展示

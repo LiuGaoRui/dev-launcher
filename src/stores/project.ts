@@ -9,7 +9,7 @@
 // onBeforeUnmount 调 stopPolling()。store 自身不感知组件生命周期。
 
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import {
   listProjects,
   createProject,
@@ -147,6 +147,14 @@ export const useProjectStore = defineStore('project', () => {
     return h === 'running' || h === 'running_abnormal'
   }
 
+  /** 运行中的项目数 */
+  const runningCount = computed(
+    () => projects.value.filter((p) => isRunning(p.id)).length,
+  )
+
+  /** 项目总数 */
+  const totalCount = computed(() => projects.value.length)
+
   /** 安全执行任一 action，返回 [data, error] 二元组 */
   async function safe<T>(fn: () => Promise<T>): Promise<[T | null, string | null]> {
     return safeCall(fn)
@@ -175,6 +183,8 @@ export const useProjectStore = defineStore('project', () => {
     stopPolling,
     getHealth,
     isRunning,
+    runningCount,
+    totalCount,
     safe,
     onGroupDeleted,
   }

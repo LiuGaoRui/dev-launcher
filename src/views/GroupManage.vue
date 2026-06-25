@@ -5,15 +5,32 @@
 // 删除分组后，其下项目 group_id 由 DB ON DELETE SET NULL 置空；
 // 这里同步通知 project store 清理本地引用。
 
-import { computed, onMounted, reactive, ref } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
-import type { FormInstance, FormRules } from 'element-plus'
+import { computed, h, onMounted, reactive, ref } from 'vue'
+import {
+  NButton,
+  NTag,
+  NSpace,
+  NInput,
+  NForm,
+  NFormItem,
+  NDataTable,
+  NEmpty,
+  useMessage,
+  useDialog,
+  type DataTableColumns,
+} from 'naive-ui'
+import {
+  ChevronUpOutline,
+  ChevronDownOutline,
+} from '@vicons/ionicons5'
 import { useGroupStore } from '@/stores/group'
 import { useProjectStore } from '@/stores/project'
 import type { Group } from '@/types/group'
 
 const groupStore = useGroupStore()
 const projectStore = useProjectStore()
+const message = useMessage()
+const dialog = useDialog()
 
 onMounted(() => groupStore.fetchAll())
 
@@ -35,36 +52,7 @@ function projectCountOf(groupId: number): number {
 /** 表格数据按 order 升序（store 已保证有序，直接引用） */
 const tableData = computed(() => groupStore.groups)
 
-// ===== 新建 =====
-
-const createForm = reactive({ name: '' })
-const createFormRef = ref<FormInstance>()
-const creating = ref(false)
-
-const createRules: FormRules<{ name: string }> = {
-  name: [{ required: true, message: '请输入分组名称', trigger: 'blur' }],
-}
-
-async function handleCreate() {
-  if (!createFormRef.value) return
-  const valid = await createFormRef.value.validate().catch(() => false)
-  if (!valid) return
-  creating.value = true
-  const [, err] = await groupStore.safe(() =>
-    groupStore.add({ name: createForm.name.trim() }),
-  )
-  creating.value = false
-  if (err) {
-    ElMessage.error(`创建失败：${err}`)
-    return
-  }
-  ElMessage.success('分组已创建')
-  createForm.name = ''
-  createFormRef.value.clearValidate()
-}
-
-// ===== 重命名（行内编辑） =====
-
+// ===== 行内重命名状态 =====
 const editingId = ref<number | null>(null)
 const editingName = ref('')
 
@@ -74,18 +62,18 @@ function startRename(row: Group) {
 }
 
 async function saveRename(row: Group) {
+  if (editingId.value !== row.id) return
   const name = editingName.value.trim()
   editingId.value = null
   if (!name || name === row.name) return
   const [, err] = await groupStore.safe(() =>
     groupStore.patch(row.id, { name }),
   )
-  if (err) ElMessage.error(`重命名失败：${err}`)
-  else ElMessage.success('已更新')
+  if (err) message.error(`重命名失败：${err}`)
+  else message.success('已更新')
 }
 
 // ===== 排序（上移/下移） =====
-
 const sorting = ref(false)
 
 async function move(row: Group, dir: -1 | 1) {
@@ -95,142 +83,212 @@ async function move(row: Group, dir: -1 | 1) {
   if (target < 0 || target >= sorted.length) return
   const other = sorted[target]
   sorting.value = true
-  // 交换两者的 order
   const [, err] = await groupStore.safe(async () => {
     await groupStore.patch(row.id, { order: other.order })
     await groupStore.patch(other.id, { order: row.order })
   })
   sorting.value = false
-  if (err) ElMessage.error(`移动失败：${err}`)
+  if (err) message.error(`移动失败：${err}`)
 }
 
 // ===== 删除 =====
-
 async function handleDelete(row: Group) {
-  try {
-    await ElMessageBox.confirm(
-      `确定删除分组「${row.name}」吗？该分组下的项目将变为「未分组」（不会被删除）。`,
-      '删除确认',
-      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
+  dialog.warning({
+    title: '删除确认',
+    content: `确定删除分组「${row.name}」吗？该分组下的项目将变为「未分组」（不会被删除）。`,
+    positiveText: '删除',
+    negativeText: '取消',
+    onPositiveClick: async () => {
+      const [, err] = await groupStore.safe(() => groupStore.remove(row.id))
+      if (err) {
+        message.error(`删除失败：${err}`)
+        return
+      }
+      projectStore.onGroupDeleted(row.id)
+      message.success('已删除')
+    },
+  })
+}
+
+// ===== n-data-table 列定义 =====
+const columns = computed<DataTableColumns<Group>>(() => [
+  {
+    title: '排序',
+    key: 'sort',
+    width: 90,
+    align: 'center',
+    render: (_row, index) =>
+      h(NSpace, { justify: 'center', size: 'small', wrapItem: false }, () => [
+        h(
+          NButton,
+          {
+            size: 'tiny',
+            quaternary: true,
+            disabled: index === 0 || sorting.value,
+            onClick: () => move(tableData.value[index], -1),
+          },
+          { icon: () => h(ChevronUpOutline) },
+        ),
+        h(
+          NButton,
+          {
+            size: 'tiny',
+            quaternary: true,
+            disabled: index === tableData.value.length - 1 || sorting.value,
+            onClick: () => move(tableData.value[index], 1),
+          },
+          { icon: () => h(ChevronDownOutline) },
+        ),
+      ]),
+  },
+  {
+    title: '分组名称',
+    key: 'name',
+    minWidth: 200,
+    render: (row) =>
+      editingId.value === row.id
+        ? h(NInput, {
+            // 非受控：用 defaultValue 初始化，避免 columns computed 不追踪
+            // editingName 导致输入时光标跳动。输入由组件内部管理，
+            // saveRename 时从 editingName 取最新值即可。
+            defaultValue: editingName.value,
+            size: 'small',
+            style: 'width: 200px',
+            autofocus: true,
+            'onUpdate:value': (v: string) => (editingName.value = v),
+            onKeyup: (e: KeyboardEvent) => {
+              if (e.key === 'Enter') saveRename(row)
+            },
+            onBlur: () => saveRename(row),
+          })
+        : h(
+            'span',
+            {
+              class: 'group-name',
+              onDblclick: () => startRename(row),
+            },
+            row.name,
+          ),
+  },
+  {
+    title: '项目数',
+    key: 'count',
+    width: 100,
+    align: 'center',
+    render: (row) =>
+      h(
+        NTag,
+        { size: 'small', bordered: false, type: 'info' },
+        () => String(projectCountOf(row.id)),
+      ),
+  },
+  { title: '排序值', key: 'order', width: 90, align: 'center' },
+  { title: '创建时间', key: 'create_time', width: 180 },
+  {
+    title: '操作',
+    key: 'actions',
+    width: 160,
+    align: 'center',
+    render: (row) =>
+      h(NSpace, { justify: 'center', size: 'small' }, () => [
+        h(
+          NButton,
+          { size: 'small', quaternary: true, onClick: () => startRename(row) },
+          () => '重命名',
+        ),
+        h(
+          NButton,
+          {
+            size: 'small',
+            quaternary: true,
+            type: 'error',
+            onClick: () => handleDelete(row),
+          },
+          () => '删除',
+        ),
+      ]),
+  },
+])
+
+// ===== 新建分组表单 =====
+const createFormRef = ref()
+const createForm = reactive({ name: '' })
+const creating = ref(false)
+const createRules = {
+  name: { required: true, message: '请输入分组名称', trigger: 'blur' },
+}
+
+async function handleCreate() {
+  createFormRef.value?.validate(async (errors: unknown) => {
+    if (errors) return
+    creating.value = true
+    const [, err] = await groupStore.safe(() =>
+      groupStore.add({ name: createForm.name.trim() }),
     )
-  } catch {
-    return
-  }
-  const [, err] = await groupStore.safe(() => groupStore.remove(row.id))
-  if (err) {
-    ElMessage.error(`删除失败：${err}`)
-    return
-  }
-  // 同步清理 project store 中该分组的引用
-  projectStore.onGroupDeleted(row.id)
-  ElMessage.success('已删除')
+    creating.value = false
+    if (err) {
+      message.error(`创建失败：${err}`)
+      return
+    }
+    message.success('分组已创建')
+    createForm.name = ''
+    createFormRef.value?.restoreValidation()
+  })
 }
 </script>
 
 <template>
   <div class="group-manage-page">
-    <!-- 顶部：新建分组 -->
-    <el-card shadow="never" class="create-card">
-      <el-form
+    <div class="page-head">
+      <span class="page-name">分组管理</span>
+    </div>
+
+    <!-- 新建分组 -->
+    <div class="create-card card-surface">
+      <NForm
         ref="createFormRef"
         :model="createForm"
         :rules="createRules"
         inline
+        label-placement="left"
         @submit.prevent
       >
-        <el-form-item label="新建分组" prop="name">
-          <el-input
-            v-model="createForm.name"
+        <NFormItem label="新建分组" path="name">
+          <NInput
+            v-model:value="createForm.name"
             placeholder="如：HR系统 / 中间件 / 测试项目"
             style="width: 260px"
             clearable
             @keyup.enter="handleCreate"
           />
-        </el-form-item>
-        <el-form-item>
-          <el-button type="primary" :loading="creating" @click="handleCreate">
+        </NFormItem>
+        <NFormItem :show-label="false">
+          <NButton type="primary" :loading="creating" @click="handleCreate">
             创建
-          </el-button>
-        </el-form-item>
-      </el-form>
-    </el-card>
+          </NButton>
+        </NFormItem>
+      </NForm>
+    </div>
 
     <!-- 分组列表 -->
-    <el-card shadow="never" class="table-card">
-      <template #header>
-        <span>分组列表</span>
-      </template>
-      <el-table :data="tableData" v-loading="groupStore.loading" row-key="id">
-        <el-table-column label="排序" width="80" align="center">
-          <template #default="{ row, $index }">
-            <el-button-group>
-              <el-button
-                size="small"
-                :disabled="$index === 0 || sorting"
-                @click="move(row, -1)"
-              >
-                ↑
-              </el-button>
-              <el-button
-                size="small"
-                :disabled="$index === tableData.length - 1 || sorting"
-                @click="move(row, 1)"
-              >
-                ↓
-              </el-button>
-            </el-button-group>
-          </template>
-        </el-table-column>
-
-        <el-table-column label="分组名称" min-width="200">
-          <template #default="{ row }">
-            <template v-if="editingId === row.id">
-              <el-input
-                v-model="editingName"
-                size="small"
-                style="width: 200px"
-                @keyup.enter="saveRename(row)"
-                @blur="saveRename(row)"
-              />
-            </template>
-            <template v-else>
-              <span class="group-name" @dblclick="startRename(row)">{{ row.name }}</span>
-            </template>
-          </template>
-        </el-table-column>
-
-        <el-table-column label="项目数" width="100" align="center">
-          <template #default="{ row }">
-            <el-tag size="small" type="info" effect="plain">
-              {{ projectCountOf(row.id) }}
-            </el-tag>
-          </template>
-        </el-table-column>
-
-        <el-table-column label="排序值" width="90" align="center" prop="order" />
-
-        <el-table-column label="创建时间" width="180" prop="create_time" />
-
-        <el-table-column label="操作" width="180" align="center">
-          <template #default="{ row }">
-            <el-button size="small" text @click="startRename(row)">重命名</el-button>
-            <el-button
-              size="small"
-              type="danger"
-              text
-              @click="handleDelete(row)"
-            >
-              删除
-            </el-button>
-          </template>
-        </el-table-column>
-      </el-table>
-
-      <el-empty
+    <div class="table-card card-surface">
+      <div class="card-title">分组列表</div>
+      <NDataTable
+        :columns="columns"
+        :data="tableData"
+        :loading="groupStore.loading"
+        :row-key="(row: Group) => row.id"
+        :bordered="false"
+        size="small"
+        flex-height
+        style="height: calc(100% - 44px)"
+      />
+      <NEmpty
         v-if="!groupStore.loading && tableData.length === 0"
         description="还没有分组"
+        class="table-empty"
       />
-    </el-card>
+    </div>
   </div>
 </template>
 
@@ -238,23 +296,47 @@ async function handleDelete(row: Group) {
 .group-manage-page {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 12px;
+  height: 100%;
+  min-height: 0;
 }
 
-.create-card :deep(.el-card__body) {
-  padding: 14px 16px 0;
+.page-head {
+  flex-shrink: 0;
+}
+
+.create-card {
+  padding: 14px 16px;
+  flex-shrink: 0;
 }
 
 .table-card {
-  min-height: 300px;
+  flex: 1;
+  min-height: 0;
+  padding: 0 12px 12px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.card-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  padding: 12px 0;
+  flex-shrink: 0;
+}
+.table-empty {
+  position: absolute;
 }
 
-.group-name {
+/* 行内重命名触发区 */
+:deep(.group-name) {
   cursor: text;
-  padding: 2px 4px;
+  padding: 2px 6px;
   border-radius: 3px;
+  transition: background 0.12s;
 }
-.group-name:hover {
-  background: #f5f7fa;
+:deep(.group-name:hover) {
+  background: var(--sidebar-hover-bg);
 }
 </style>

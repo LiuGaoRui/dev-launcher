@@ -2,18 +2,30 @@
 // 项目详情页 —— 阶段 6 日志中心。
 //
 // 布局：
-//   顶部：项目信息卡（名称/类型/路径/启动命令/状态徽标）+ 返回按钮
-//   主体：日志面板
-//     - 实时模式：订阅 Channel，自动滚到底部，可清空当日日志
-//     - 历史模式：选日期（list_log_dates），按页加载（上/下一页）
+//   顶部：面包屑（项目 / 项目名）+ 返回
+//   主体：
+//     - 项目信息卡（名称/类型/路径/启动命令/状态徽标）+ 实时指标
+//     - 日志面板
+//       - 实时模式：订阅 Channel，自动滚到底部，可清空当日日志
+//       - 历史模式：选日期（list_log_dates），按页加载
 //
 // 生命周期：进入默认实时订阅；离开 stopLive + reset 释放订阅。
 // 实时模式自动滚底通过 watch(lines) 实现。
 
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage, ElMessageBox } from 'element-plus'
-import { ArrowLeft, Delete } from '@element-plus/icons-vue'
+import {
+  NBreadcrumb,
+  NBreadcrumbItem,
+  NEmpty,
+  NTag,
+  NRadioGroup,
+  NRadioButton,
+  NSelect,
+  NButton,
+  useMessage,
+  useDialog,
+} from 'naive-ui'
 import { getProject } from '@/api/project'
 import { PROJECT_TYPE_LABELS, type Project } from '@/types/project'
 import { useProjectStore } from '@/stores/project'
@@ -25,6 +37,8 @@ const route = useRoute()
 const router = useRouter()
 const projectStore = useProjectStore()
 const logStore = useLogStore()
+const message = useMessage()
+const dialog = useDialog()
 
 const projectId = computed(() => Number(route.params.id))
 const project = ref<Project | null>(null)
@@ -49,7 +63,6 @@ onMounted(async () => {
   project.value = p
 
   // 确保轮询在运行（幂等：列表页已启动则 no-op；直接进详情页则在此启动）。
-  // 注意：不在此 stopPolling —— 轮询是全局共享的，由列表页管生命周期。
   projectStore.startPolling()
 
   // 默认进入实时模式
@@ -93,6 +106,13 @@ async function switchMode(m: 'live' | 'history') {
 
 // ===== 历史翻页 =====
 
+const historyDateOptions = computed(() =>
+  logStore.dates.map((d) => ({
+    label: `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`,
+    value: d,
+  })),
+)
+
 async function pickHistoryDate(date: string) {
   if (!date) return
   await logStore.loadHistory(projectId.value, date, true)
@@ -105,17 +125,16 @@ async function nextPage() {
 // ===== 清空日志 =====
 
 async function handleClear() {
-  try {
-    await ElMessageBox.confirm('确定清空当天日志吗？此操作不可恢复。', '清空确认', {
-      type: 'warning',
-      confirmButtonText: '清空',
-      cancelButtonText: '取消',
-    })
-  } catch {
-    return // 取消
-  }
-  const ok = await logStore.clear(projectId.value)
-  if (ok) ElMessage.success('已清空当日日志')
+  dialog.warning({
+    title: '清空确认',
+    content: '确定清空当天日志吗？此操作不可恢复。',
+    positiveText: '清空',
+    negativeText: '取消',
+    onPositiveClick: async () => {
+      const ok = await logStore.clear(projectId.value)
+      if (ok) message.success('已清空当日日志')
+    },
+  })
 }
 
 function goBack() {
@@ -136,22 +155,25 @@ const lineCount = computed(() => {
 
 <template>
   <div class="detail-page">
-    <!-- 顶部工具栏 -->
+    <!-- 面包屑 + 返回 -->
     <div class="topbar">
-      <el-button :icon="ArrowLeft" text @click="goBack">返回</el-button>
+      <NBreadcrumb>
+        <NBreadcrumbItem clickable @click="goBack">项目</NBreadcrumbItem>
+        <NBreadcrumbItem>{{ project?.name ?? '...' }}</NBreadcrumbItem>
+      </NBreadcrumb>
     </div>
 
     <!-- 加载错误 -->
-    <el-empty v-if="loadErr" :description="loadErr" />
+    <NEmpty v-if="loadErr" :description="loadErr" />
 
     <template v-else-if="project">
       <!-- 项目信息卡 -->
-      <el-card class="info-card" shadow="never" :body-style="{ padding: '16px 20px' }">
+      <div class="info-card card-surface">
         <div class="info-head">
           <span class="name">{{ project.name }}</span>
-          <el-tag size="small" type="primary" effect="plain">
+          <NTag size="small" type="primary" :bordered="false">
             {{ PROJECT_TYPE_LABELS[project.type] }}
-          </el-tag>
+          </NTag>
           <StatusBadge :health="health" />
         </div>
         <div class="info-meta">
@@ -172,64 +194,56 @@ const lineCount = computed(() => {
         <div v-if="status && health !== 'stopped'" class="metrics-wrap">
           <MetricsBar :status="status" />
         </div>
-      </el-card>
+      </div>
 
       <!-- 日志面板 -->
-      <el-card class="log-card" shadow="never">
-        <template #header>
-          <div class="log-header">
-            <el-radio-group
-              :model-value="logStore.mode"
+      <div class="log-card card-surface">
+        <div class="log-header">
+          <NRadioGroup
+            :value="logStore.mode"
+            size="small"
+            @update:value="(v: string) => switchMode(v as 'live' | 'history')"
+          >
+            <NRadioButton value="live">实时</NRadioButton>
+            <NRadioButton value="history">历史</NRadioButton>
+          </NRadioGroup>
+
+          <!-- 历史模式：日期选择 + 翻页 -->
+          <div v-if="logStore.mode === 'history'" class="history-controls">
+            <NSelect
+              :value="logStore.historyDate"
+              :options="historyDateOptions"
               size="small"
-              @change="(v: string | number | boolean) => switchMode(v as 'live' | 'history')"
+              placeholder="选择日期"
+              style="width: 150px"
+              @update:value="(v: string) => pickHistoryDate(v)"
+            />
+            <NButton
+              size="small"
+              :disabled="!logStore.historyHasMore"
+              @click="nextPage"
             >
-              <el-radio-button value="live">实时</el-radio-button>
-              <el-radio-button value="history">历史</el-radio-button>
-            </el-radio-group>
-
-            <!-- 历史模式：日期选择 + 翻页 -->
-            <div v-if="logStore.mode === 'history'" class="history-controls">
-              <el-select
-                :model-value="logStore.historyDate"
-                size="small"
-                placeholder="选择日期"
-                style="width: 150px"
-                @change="(v: string) => pickHistoryDate(v)"
-              >
-                <el-option
-                  v-for="d in logStore.dates"
-                  :key="d"
-                  :label="`${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}`"
-                  :value="d"
-                />
-              </el-select>
-              <el-button
-                size="small"
-                :disabled="!logStore.historyHasMore"
-                @click="nextPage"
-              >
-                加载更多
-              </el-button>
-            </div>
-
-            <div class="log-actions">
-              <span class="line-count">{{ lineCount }} 行</span>
-              <el-button
-                v-if="logStore.mode === 'live'"
-                size="small"
-                :icon="Delete"
-                @click="handleClear"
-              >
-                清空
-              </el-button>
-            </div>
+              加载更多
+            </NButton>
           </div>
-        </template>
 
-        <div v-loading="logStore.loading" class="log-body">
+          <div class="log-actions">
+            <span class="line-count">{{ lineCount }} 行</span>
+            <NButton
+              v-if="logStore.mode === 'live'"
+              size="small"
+              tertiary
+              @click="handleClear"
+            >
+              清空
+            </NButton>
+          </div>
+        </div>
+
+        <div class="log-body">
           <pre ref="logBox" class="log-text">{{ logStore.lines || '（暂无日志）' }}</pre>
         </div>
-      </el-card>
+      </div>
     </template>
   </div>
 </template>
@@ -238,15 +252,17 @@ const lineCount = computed(() => {
 .detail-page {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 12px;
   height: 100%;
   min-height: 0;
 }
 .topbar {
   flex-shrink: 0;
 }
-.info-card,
-.log-card {
+
+/* 信息卡 */
+.info-card {
+  padding: 14px 18px;
   flex-shrink: 0;
 }
 .info-head {
@@ -258,14 +274,14 @@ const lineCount = computed(() => {
 .info-head .name {
   font-size: 16px;
   font-weight: 600;
-  color: #303133;
+  color: var(--text-primary);
 }
 .info-meta {
   display: flex;
   flex-direction: column;
   gap: 4px;
   font-size: 12px;
-  color: #606266;
+  color: var(--text-secondary);
 }
 .meta-row {
   display: flex;
@@ -274,7 +290,7 @@ const lineCount = computed(() => {
 }
 .lbl {
   width: 32px;
-  color: #909399;
+  color: var(--text-tertiary);
   flex-shrink: 0;
 }
 .val {
@@ -285,35 +301,33 @@ const lineCount = computed(() => {
   white-space: nowrap;
 }
 .val.code {
-  font-family: 'Consolas', 'Courier New', monospace;
-  color: #303133;
+  font-family: var(--code-font);
+  color: var(--text-primary);
 }
 .metrics-wrap {
   margin-top: 10px;
   padding: 8px 10px;
-  background: #f5f7fa;
+  background: var(--status-running-soft);
   border-radius: 4px;
 }
 
-/* 日志卡片占满剩余高度 */
+/* 日志面板（占满剩余高度） */
 .log-card {
   flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
-}
-.log-card :deep(.el-card__body) {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  padding: 0;
+  overflow: hidden;
 }
 .log-header {
   display: flex;
   align-items: center;
   gap: 12px;
   flex-wrap: wrap;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--divider);
+  background: var(--toolbar-bg);
+  flex-shrink: 0;
 }
 .history-controls {
   display: flex;
@@ -328,7 +342,8 @@ const lineCount = computed(() => {
 }
 .line-count {
   font-size: 12px;
-  color: #909399;
+  color: var(--text-tertiary);
+  font-family: var(--code-font);
 }
 .log-body {
   flex: 1;
@@ -340,11 +355,11 @@ const lineCount = computed(() => {
   flex: 1;
   margin: 0;
   padding: 12px 14px;
-  font-family: 'Consolas', 'Courier New', monospace;
+  font-family: var(--code-font);
   font-size: 12.5px;
   line-height: 1.5;
-  color: #303133;
-  background: #fafafa;
+  color: var(--terminal-info-fg);
+  background: var(--terminal-info-bg);
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-all;

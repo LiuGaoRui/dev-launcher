@@ -16,9 +16,15 @@ use crate::error::{AppError, AppResult};
 pub const DB_CONN_URL: &str = "sqlite:devlauncher.db";
 
 /// 从 Tauri managed state 取出 SQLite 连接池的克隆。
+///
+/// 注意：`DbInstances` 内部是 `RwLock`。Tauri 命令运行在 tokio 多线程 runtime 的
+/// worker 线程上，直接用 `blocking_read()` 会触发 panic（"Cannot block the current
+/// thread from within a runtime"）。改用 `block_in_place` 显式声明此处允许阻塞，
+/// 它会把当前 worker 线程转为阻塞线程，避免 panic。
 pub fn pool<R: Runtime>(app: &AppHandle<R>) -> AppResult<sqlx::Pool<Sqlite>> {
     let instances = app.state::<tauri_plugin_sql::DbInstances>();
-    let map = instances.0.blocking_read();
+    // block_in_place 仅在多线程 runtime 有效；Tauri 默认使用多线程 flavor。
+    let map = tokio::task::block_in_place(|| instances.0.blocking_read());
 
     match map.get(DB_CONN_URL) {
         Some(tauri_plugin_sql::DbPool::Sqlite(p)) => Ok(p.clone()),

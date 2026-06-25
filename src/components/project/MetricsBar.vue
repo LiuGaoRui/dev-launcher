@@ -3,6 +3,7 @@
 //
 // 仅在项目运行中（running / running_abnormal）时由父组件渲染。
 // 端口徽标三态：listening&&owned 绿、listening&&!owned 橙(被占用)、!listening 灰。
+import { NTag } from 'naive-ui'
 import { formatBytes, type ProjectStatus } from '@/types/monitor'
 
 const props = defineProps<{
@@ -27,9 +28,9 @@ const props = defineProps<{
         class="port-item"
       >
         <span class="port-num">{{ p.port }}</span>
-        <el-tag v-if="!p.listening" type="info" size="small" effect="plain">未监听</el-tag>
-        <el-tag v-else-if="!p.owned" type="warning" size="small" effect="plain">被占用</el-tag>
-        <el-tag v-else type="success" size="small" effect="plain">监听中</el-tag>
+        <NTag v-if="!p.listening" size="tiny" :bordered="false">未监听</NTag>
+        <NTag v-else-if="!p.owned" type="warning" size="tiny" :bordered="false">被占用</NTag>
+        <NTag v-else type="success" size="tiny" :bordered="false">监听中</NTag>
       </span>
     </span>
   </div>
@@ -42,7 +43,7 @@ const props = defineProps<{
   gap: 12px;
   align-items: center;
   font-size: 12px;
-  color: #606266;
+  color: var(--text-secondary);
 }
 .metric {
   display: inline-flex;
@@ -50,11 +51,11 @@ const props = defineProps<{
   gap: 4px;
 }
 .m-label {
-  color: #909399;
+  color: var(--text-tertiary);
 }
 .m-value {
-  font-family: 'Consolas', 'Courier New', monospace;
-  color: #303133;
+  font-family: var(--code-font);
+  color: var(--text-primary);
   font-weight: 500;
 }
 .ports {
@@ -68,8 +69,8 @@ const props = defineProps<{
   gap: 3px;
 }
 .port-num {
-  font-family: 'Consolas', 'Courier New', monospace;
-  color: #409eff;
+  font-family: var(--code-font);
+  color: var(--accent);
   font-weight: 600;
 }
 </style>

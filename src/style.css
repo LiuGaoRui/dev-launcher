@@ -1,3 +1,9 @@
+/* 全局 reset + 基础排版 + 滚动条美化。
+ *
+ * 颜色体系见 styles/theme.css（CSS 变量）。
+ * Naive UI 组件主题由 App.vue 的 n-config-provider 驱动。
+ */
+
 * {
   margin: 0;
   padding: 0;
@@ -13,24 +19,63 @@ body,
 }
 
 body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue',
-    Arial, 'Microsoft YaHei', sans-serif;
-  font-size: 14px;
-  color: #333;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+    'PingFang SC', 'Microsoft YaHei', sans-serif;
+  font-size: 13px;
+  color: var(--text-primary);
+  background: var(--content-bg);
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-/* Element Plus 暗色侧边栏菜单适配 */
-.app-menu .el-menu-item {
-  color: #b3b3b3;
+/* 自定义滚动条（桌面软件质感） */
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(128, 128, 128, 0.35);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(128, 128, 128, 0.55);
+  background-clip: content-box;
 }
 
-.app-menu .el-menu-item:hover {
-  background: #1890ff !important;
-  color: #fff !important;
+/* 状态指示点（侧边栏、状态栏共用） */
+.status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--status-stopped);
+  flex-shrink: 0;
+}
+.status-dot--on {
+  background: var(--status-running);
+  box-shadow: 0 0 0 3px var(--status-running-soft);
+  animation: pulse 1.8s ease-in-out infinite;
 }
 
-.app-menu .el-menu-item.is-active {
-  background: #1890ff !important;
-  color: #fff !important;
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* 页面标题 */
+.page-name {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* 卡片/面板表面 */
+.card-surface {
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  border-radius: 6px;
 }

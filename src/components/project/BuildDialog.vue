@@ -1,12 +1,17 @@
 <script setup lang="ts">
 // 构建日志对话框 —— 阶段 7。
 //
-// 展示 build store 的实时输出（stdout 黑色 / stderr 红色），底部状态条：
+// 展示 build store 的实时输出（stdout 默认色 / stderr 红色），底部状态条：
 // 进行中（转圈）/ 成功（绿）/ 失败（红）/ 命令错误。
 // 关闭对话框 → reset 释放 Channel（GC → 后端读取 task 退出 → kill_on_drop 回收）。
 
 import { computed, nextTick, ref, watch } from 'vue'
-import { CircleCheck, CircleClose, Loading } from '@element-plus/icons-vue'
+import { NModal, NIcon, NButton } from 'naive-ui'
+import {
+  CheckmarkCircleOutline,
+  CloseCircleOutline,
+  RefreshOutline,
+} from '@vicons/ionicons5'
 import { useBuildStore } from '@/stores/build'
 
 const props = defineProps<{
@@ -25,7 +30,6 @@ const buildStore = useBuildStore()
 /** 输出区 DOM 引用（自动滚到底部） */
 const outBox = ref<HTMLDivElement | null>(null)
 
-/** 把输出行拍平为可渲染的文本（带 stderr 标记用于着色） */
 const visible = computed({
   get: () => props.modelValue,
   set: (v: boolean) => emit('update:modelValue', v),
@@ -69,13 +73,13 @@ function handleClose() {
 </script>
 
 <template>
-  <el-dialog
-    v-model="visible"
+  <NModal
+    v-model:show="visible"
+    preset="card"
     :title="`构建「${projectName}」`"
-    width="80%"
-    top="6vh"
-    align-center
-    @close="handleClose"
+    style="width: 80vw; max-width: 1100px"
+    :mask-closable="false"
+    @after-leave="handleClose"
   >
     <div class="build-output" ref="outBox">
       <span
@@ -92,15 +96,15 @@ function handleClose() {
     <template #footer>
       <div class="footer">
         <div class="status" :class="phase">
-          <el-icon v-if="phase === 'running'" class="spin"><Loading /></el-icon>
-          <el-icon v-else-if="phase === 'succeeded'"><CircleCheck /></el-icon>
-          <el-icon v-else><CircleClose /></el-icon>
+          <NIcon v-if="phase === 'running'" class="spin"><RefreshOutline /></NIcon>
+          <NIcon v-else-if="phase === 'succeeded'"><CheckmarkCircleOutline /></NIcon>
+          <NIcon v-else><CloseCircleOutline /></NIcon>
           <span>{{ statusText }}</span>
         </div>
-        <el-button :disabled="buildStore.running" @click="visible = false">关闭</el-button>
+        <NButton :disabled="buildStore.running" @click="visible = false">关闭</NButton>
       </div>
     </template>
-  </el-dialog>
+  </NModal>
 </template>
 
 <style scoped>
@@ -108,13 +112,13 @@ function handleClose() {
   height: 50vh;
   min-height: 240px;
   overflow: auto;
-  background: #1e1e1e;
+  background: var(--terminal-bg);
   border-radius: 6px;
   padding: 12px 14px;
-  font-family: 'Consolas', 'Courier New', monospace;
+  font-family: var(--code-font);
   font-size: 12.5px;
   line-height: 1.55;
-  color: #d4d4d4;
+  color: var(--terminal-fg);
   white-space: pre-wrap;
   word-break: break-all;
 }
@@ -122,10 +126,10 @@ function handleClose() {
   white-space: pre-wrap;
 }
 .line.err {
-  color: #f56c6c;
+  color: var(--terminal-err);
 }
 .placeholder {
-  color: #888;
+  color: var(--terminal-dim);
 }
 .footer {
   display: flex;
@@ -140,14 +144,14 @@ function handleClose() {
   font-size: 13px;
 }
 .status.running {
-  color: #409eff;
+  color: var(--accent);
 }
 .status.succeeded {
-  color: #67c23a;
+  color: var(--status-running);
 }
 .status.failed,
 .status.error {
-  color: #f56c6c;
+  color: var(--terminal-err);
 }
 .spin {
   animation: rotate 1.2s linear infinite;
