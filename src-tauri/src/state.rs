@@ -4,10 +4,12 @@ use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 
 use crate::error::AppResult;
+use crate::process::ProcessRegistry;
 
 /// 全局共享状态
 ///
-/// 阶段 0 只有基础路径，后续阶段补充 ProcessRegistry / DB 连接池等。
+/// - `data_dir` / `logs_root`：路径常量
+/// - `registry`：运行中进程注册表
 pub struct AppState {
     inner: Arc<Inner>,
 }
@@ -17,6 +19,8 @@ struct Inner {
     data_dir: std::path::PathBuf,
     /// 日志根目录
     logs_root: std::path::PathBuf,
+    /// 运行中进程注册表
+    registry: ProcessRegistry,
 }
 
 impl AppState {
@@ -35,6 +39,7 @@ impl AppState {
             inner: Arc::new(Inner {
                 data_dir,
                 logs_root,
+                registry: ProcessRegistry::new(),
             }),
         })
     }
@@ -45,5 +50,10 @@ impl AppState {
 
     pub fn logs_root(&self) -> &std::path::Path {
         &self.inner.logs_root
+    }
+
+    /// 进程注册表（共享引用，内部自带 Mutex）。
+    pub fn registry(&self) -> &ProcessRegistry {
+        &self.inner.registry
     }
 }

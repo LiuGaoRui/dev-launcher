@@ -38,12 +38,20 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[dev-dependencies]
+tempfile = "3"
+
 [target.'cfg(windows)'.dependencies]
+# windows crate features:
+# - Win32_Foundation: HANDLE / CloseHandle
+# - Win32_Security: CreateJobObjectW 的 SECURITY_ATTRIBUTES 参数（即便传 None 也需此 feature）
+# - Win32_System_JobObjects: Job Object 全套 API
+# - Win32_System_Threading: OpenProcess / IO_COUNTERS / PROCESS_ACCESS_RIGHTS
 windows = { version = "0.58", features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
-    "Win32_System_ProcessStatus",
 ] }
 
 [features]

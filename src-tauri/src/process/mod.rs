@@ -1,0 +1,24 @@
+//! 进程托管核心
+//!
+//! 模块结构（见 docs/10-目录结构规范.md）：
+//! - `job_object`：Windows Job Object 的 unsafe FFI 封装（杀整树）
+//! - `spawn`：tokio::process::Command + stdio→file 重定向
+//! - `registry`：ProcessRegistry，运行中进程注册表
+//! - `tree`：基于 sysinfo 收集后代 PID（供监控用）
+
+pub mod job_object;
+pub mod registry;
+pub mod spawn;
+pub mod tree;
+
+pub use registry::ProcessRegistry;
+
+use serde::Serialize;
+
+/// start_project / restart_project 的返回值（对齐命令清单）。
+#[derive(Debug, Clone, Serialize)]
+pub struct StartResult {
+    pub root_pid: u32,
+    pub log_path: String,
+    pub started_at: String,
+}
