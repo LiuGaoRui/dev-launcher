@@ -4,7 +4,10 @@ use serde::Serialize;
 use thiserror::Error;
 
 /// 所有 command 的统一错误
+///
+/// `AlreadyRunning` / `NotRunning` 预留给阶段 2 进程托管使用。
 #[derive(Debug, Error)]
+#[allow(dead_code)] // 部分变体为后续阶段预留
 pub enum AppError {
     #[error("项目不存在: id={0}")]
     ProjectNotFound(i64),
@@ -21,11 +24,17 @@ pub enum AppError {
     #[error("分组名称已存在: {0}")]
     GroupNameExists(String),
 
+    #[error("项目名称已存在: {0}")]
+    ProjectNameExists(String),
+
     #[error("IO 错误: {0}")]
     Io(#[from] std::io::Error),
 
     #[error("数据库错误: {0}")]
     Database(String),
+
+    #[error("SQL 错误: {0}")]
+    Sqlx(#[from] sqlx::Error),
 
     #[error("进程错误: {0}")]
     Process(String),

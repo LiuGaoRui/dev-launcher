@@ -1,8 +1,12 @@
 //! DevLauncher 后端入口
 //!
-//! MVP 阶段 0：最小可运行骨架。
+//! 阶段 1：DB 层（migration + models + services + commands）就位。
 
+mod commands;
+mod db;
 mod error;
+mod models;
+mod services;
 mod state;
 
 use tauri::Manager;
@@ -23,7 +27,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_sql::Builder::default()
-                .add_migrations("sqlite:devlauncher.db", migrations())
+                .add_migrations(db::DB_CONN_URL, db::migrations::migrations())
                 .build(),
         )
         .setup(|app| {
@@ -32,11 +36,19 @@ pub fn run() {
             app.manage(state);
             Ok(())
         })
+        .invoke_handler(tauri::generate_handler![
+            // group
+            commands::group::list_groups,
+            commands::group::create_group,
+            commands::group::update_group,
+            commands::group::delete_group,
+            // project
+            commands::project::list_projects,
+            commands::project::get_project,
+            commands::project::create_project,
+            commands::project::update_project,
+            commands::project::delete_project,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
-}
-
-/// 注册数据库迁移（阶段 1 填充实际 SQL）
-fn migrations() -> Vec<tauri_plugin_sql::Migration> {
-    vec![]
 }
