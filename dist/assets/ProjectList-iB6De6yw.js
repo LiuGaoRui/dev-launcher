@@ -1,1 +1,0 @@
-import{_ as c}from"./PlaceholderPage-BBWZrraA.js";import{_ as e,o as n,c as t}from"./index-CH0WCVLU.js";const r={};function _(s,a){const o=c;return n(),t(o,{description:"项目列表（阶段 3 实现）"})}const f=e(r,[["render",_]]);export{f as default};

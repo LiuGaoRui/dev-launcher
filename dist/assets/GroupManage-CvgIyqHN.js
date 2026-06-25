@@ -1,1 +1,0 @@
-import{_ as e}from"./PlaceholderPage-BBWZrraA.js";import{_ as c,o as n,c as r}from"./index-CH0WCVLU.js";const _={};function t(a,s){const o=e;return n(),r(o,{description:"分组管理（阶段 3 实现）"})}const i=c(_,[["render",t]]);export{i as default};
