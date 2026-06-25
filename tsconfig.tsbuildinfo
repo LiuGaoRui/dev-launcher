@@ -1,0 +1,1 @@
+{"root":["./src/env.d.ts","./src/main.ts","./src/api/group.ts","./src/api/invoke.ts","./src/api/process.ts","./src/api/project.ts","./src/router/index.ts","./src/stores/group.ts","./src/stores/project.ts","./src/types/group.ts","./src/types/project.ts"],"version":"5.6.2"}
