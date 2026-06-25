@@ -1,6 +1,6 @@
 //! 全局应用状态
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager};
 
 use crate::error::AppResult;
@@ -10,6 +10,8 @@ use crate::process::ProcessRegistry;
 ///
 /// - `data_dir` / `logs_root`：路径常量
 /// - `registry`：运行中进程注册表
+/// - `system`：持久化 sysinfo System，监控 probe 时 refresh 形成 CPU 基线
+///   （sysinfo cpu_usage 需两次 refresh 间隔才准确，故全程复用同一实例）
 pub struct AppState {
     inner: Arc<Inner>,
 }
@@ -21,6 +23,8 @@ struct Inner {
     logs_root: std::path::PathBuf,
     /// 运行中进程注册表
     registry: ProcessRegistry,
+    /// 持久化 sysinfo，监控探测用
+    system: Mutex<sysinfo::System>,
 }
 
 impl AppState {
@@ -40,6 +44,7 @@ impl AppState {
                 data_dir,
                 logs_root,
                 registry: ProcessRegistry::new(),
+                system: Mutex::new(sysinfo::System::new()),
             }),
         })
     }
@@ -55,5 +60,10 @@ impl AppState {
     /// 进程注册表（共享引用，内部自带 Mutex）。
     pub fn registry(&self) -> &ProcessRegistry {
         &self.inner.registry
+    }
+
+    /// 持久化 sysinfo System（监控探测用）。
+    pub fn system(&self) -> &Mutex<sysinfo::System> {
+        &self.inner.system
     }
 }

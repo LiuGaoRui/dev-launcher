@@ -11,7 +11,6 @@ use sysinfo::{Pid, System};
 /// 收集 `root` PID 的全部后代 PID（不含 root 自身），递归。
 ///
 /// 通过反复扫描「父 PID == 已知节点」的关系。进程树天然是树结构（无环），无需去重。
-#[allow(dead_code)] // 阶段 5 监控（端口归属/CPU 聚合）使用
 pub fn collect_descendants(root: u32, system: &System) -> Vec<u32> {
     let root_pid = Pid::from_u32(root);
     let mut all: Vec<u32> = Vec::new();
@@ -30,7 +29,6 @@ pub fn collect_descendants(root: u32, system: &System) -> Vec<u32> {
 }
 
 /// 收集包含 root 自身的全树 PID（root 在首位）。
-#[allow(dead_code)] // 阶段 5 监控使用
 pub fn collect_tree(root: u32, system: &System) -> Vec<u32> {
     let mut tree = vec![root];
     tree.extend(collect_descendants(root, system));

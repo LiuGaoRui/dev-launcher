@@ -3,15 +3,22 @@
 //
 // 本组件只负责展示与抛事件，真正的 store 操作交给父组件（ProjectList），
 // 这样卡片无状态、易测试、可复用。
+//
+// 阶段 5：运行态信息（health/PID/CPU/内存/端口）来自 status prop，
+// 静态配置信息（名称/类型/路径/启动命令/预期端口）来自 project prop。
 
+import { computed } from 'vue'
 import { PROJECT_TYPE_LABELS } from '@/types/project'
 import type { Project } from '@/types/project'
+import type { HealthStatus, ProjectStatus } from '@/types/monitor'
 import StatusBadge from './StatusBadge.vue'
+import MetricsBar from './MetricsBar.vue'
 import ActionBar from './ActionBar.vue'
 
 const props = defineProps<{
   project: Project
-  running: boolean
+  /** 运行态探测结果（null = 未运行/stopped） */
+  status?: ProjectStatus | null
   /** 是否有进行中的启停操作（禁用按钮） */
   busy?: boolean
 }>()
@@ -25,6 +32,15 @@ const emit = defineEmits<{
   /** 点击卡片主体（进入详情，阶段 4+ 实现） */
   open: []
 }>()
+
+/** 健康状态：有探测结果用其 health，否则 stopped */
+const health = computed<HealthStatus>(() => props.status?.health ?? 'stopped')
+
+/** 是否运行中（running 或 running_abnormal） */
+const running = computed(() => health.value !== 'stopped')
+
+/** 实时 PID（优先 status.pid，回退 project.last_pid 缓存） */
+const pid = computed(() => props.status?.pid ?? props.project.last_pid ?? null)
 
 /** 端口列表展示为逗号分隔，空则显示 「-」 */
 function portsText(p: Project): string {
@@ -42,7 +58,7 @@ function portsText(p: Project): string {
           <el-tag size="small" type="primary" effect="plain">
             {{ PROJECT_TYPE_LABELS[props.project.type] }}
           </el-tag>
-          <StatusBadge :running="props.running" />
+          <StatusBadge :health="health" />
         </div>
       </div>
 
@@ -60,13 +76,18 @@ function portsText(p: Project): string {
         <div class="meta-row">
           <span class="meta-label">端口</span>
           <span class="meta-value">{{ portsText(props.project) }}</span>
-          <span v-if="props.project.last_pid" class="pid">PID {{ props.project.last_pid }}</span>
+          <span v-if="pid" class="pid">PID {{ pid }}</span>
         </div>
+      </div>
+
+      <!-- 运行中时展示实时指标（CPU/内存/端口探测结果） -->
+      <div v-if="props.status && running" class="metrics-wrap">
+        <MetricsBar :status="props.status" />
       </div>
 
       <div class="actions" @click.stop>
         <ActionBar
-          :running="props.running"
+          :running="running"
           :busy="props.busy"
           @start="emit('start')"
           @stop="emit('stop')"
@@ -145,6 +166,12 @@ function portsText(p: Project): string {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.metrics-wrap {
+  margin-bottom: 12px;
+  padding: 8px 10px;
+  background: #f5f7fa;
+  border-radius: 4px;
 }
 .pid {
   font-size: 11px;

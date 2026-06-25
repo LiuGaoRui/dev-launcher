@@ -12,7 +12,6 @@ use std::sync::Mutex;
 use tokio::process::Child;
 
 /// 一个运行中的项目进程。
-#[allow(dead_code)] // pid/log_path/started_at 由 snapshot 间接读取，阶段 5 监控直读
 pub struct RunningProcess {
     pub child: Child,
     pub job: JobHandle,
@@ -22,7 +21,6 @@ pub struct RunningProcess {
 }
 
 /// RunningProcess 的只读快照（避免持锁访问 child）。
-#[allow(dead_code)] // 阶段 5 监控批量查询用
 #[derive(Debug, Clone)]
 pub struct ProcessSnapshot {
     pub pid: u32,
@@ -75,14 +73,12 @@ impl ProcessRegistry {
     }
 
     /// 取只读快照（不持锁访问 child）。
-    #[allow(dead_code)] // 阶段 5 监控批量查询用
     pub fn snapshot(&self, project_id: i64) -> Option<ProcessSnapshot> {
         let map = self.inner.lock().expect("registry mutex poisoned");
         map.get(&project_id).map(ProcessSnapshot::from)
     }
 
     /// 列出所有运行中 project_id（供 monitor 批量查询）。
-    #[allow(dead_code)] // 阶段 5 监控批量查询用
     pub fn running_ids(&self) -> Vec<i64> {
         let map = self.inner.lock().expect("registry mutex poisoned");
         map.keys().copied().collect()

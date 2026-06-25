@@ -5,7 +5,7 @@
 // 能力：新建/编辑/删除项目、启动/停止/重启、按分组筛选。
 // 编排：所有 store 操作在本页面集中进行，卡片组件无状态。
 
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useGroupStore } from '@/stores/group'
 import { useProjectStore } from '@/stores/project'
@@ -69,7 +69,14 @@ async function loadAll() {
   await Promise.all([groupStore.fetchAll(), projectStore.fetchAll()])
 }
 
-onMounted(loadAll)
+// 加载数据并启动监控轮询（阶段 5）：挂载时 start，卸载时 stop
+onMounted(async () => {
+  await loadAll()
+  projectStore.startPolling()
+})
+onBeforeUnmount(() => {
+  projectStore.stopPolling()
+})
 
 // ===== 启停重启 =====
 
@@ -183,7 +190,7 @@ async function handleSubmitForm(input: ProjectInput, origin: Project | null) {
           v-for="p in filteredProjects"
           :key="p.id"
           :project="p"
-          :running="projectStore.isRunning(p.id)"
+          :status="projectStore.statuses[p.id] ?? null"
           :busy="busyIds.has(p.id)"
           @start="handleStart(p)"
           @stop="handleStop(p)"

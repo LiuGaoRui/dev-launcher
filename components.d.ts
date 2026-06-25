@@ -30,6 +30,7 @@ declare module 'vue' {
     ElTable: typeof import('element-plus/es')['ElTable']
     ElTableColumn: typeof import('element-plus/es')['ElTableColumn']
     ElTag: typeof import('element-plus/es')['ElTag']
+    MetricsBar: typeof import('./src/components/project/MetricsBar.vue')['default']
     PlaceholderPage: typeof import('./src/components/PlaceholderPage.vue')['default']
     ProjectCard: typeof import('./src/components/project/ProjectCard.vue')['default']
     ProjectFormDialog: typeof import('./src/components/project/ProjectFormDialog.vue')['default']

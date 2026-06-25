@@ -1,16 +1,20 @@
-//! process 命令薄层：start_project / stop_project / restart_project
+//! process 命令薄层：start_project / stop_project / restart_project / probe_statuses
 //!
 //! 签名对齐 docs/03-命令清单.md §四。
-//! 从 AppState 取 registry + logs_root，从 AppHandle 取 DB pool。
+//! 从 AppState 取 registry + logs_root + system，从 AppHandle 取 DB pool。
 
+use std::collections::HashMap;
 use std::time::Duration;
 
+use sqlx::Row;
+use sysinfo::ProcessesToUpdate;
 use tauri::{AppHandle, Manager, Runtime};
 
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::models::now_iso;
 use crate::process::job_object::JobHandle;
+use crate::process::monitor::{collect_tcp_sockets, probe_one, ProjectStatus};
 use crate::process::registry::RunningProcess;
 use crate::process::spawn::{log_file_path, spawn_command};
 use crate::process::StartResult;
@@ -138,6 +142,60 @@ pub async fn restart_project<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResul
     start_project(app, id).await
 }
 
+/// 探测项目运行态（CPU/内存/端口），阶段 5 监控面板用。
+///
+/// - `ids = None`/空：探测 registry 中全部运行中项目
+/// - `ids = Some([...])`：仅探测给定项目（前端可传当前可见集减少开销）
+///
+/// 返回的 Vec 仅含「运行中」的项目；前端对不在结果中的 id 视为 stopped。
+///
+/// 流程：refresh 系统进程（cpu 基线）→ 取 TCP socket 全表一次 →
+/// 逐项目 probe（聚合进程树 CPU/内存 + 端口归属校验）。
+#[tauri::command]
+pub async fn probe_statuses<R: Runtime>(
+    app: AppHandle<R>,
+    ids: Option<Vec<i64>>,
+) -> AppResult<Vec<ProjectStatus>> {
+    let state = app.state::<AppState>();
+    let registry = state.registry();
+
+    // 解析要探测的 id 列表：去重；过滤掉不在 registry 的（已停止）
+    let mut to_probe: Vec<i64> = match ids {
+        Some(v) if !v.is_empty() => v.into_iter().collect(),
+        _ => registry.running_ids(),
+    };
+    to_probe.sort_unstable();
+    to_probe.dedup();
+    to_probe.retain(|id| registry.contains(*id));
+
+    if to_probe.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 批量取这些项目的 expected_ports（一次 SQL，避免 N+1）
+    let pool = db::pool(&app)?;
+    let ports_map = fetch_expected_ports(&pool, &to_probe).await?;
+
+    // TCP 全表一次查（不依赖 system，放在锁外减少临界区）
+    let sockets = collect_tcp_sockets();
+
+    // 刷新系统进程（cpu 基线）并逐项目 probe
+    let mut results = Vec::with_capacity(to_probe.len());
+    {
+        // sysinfo cpu_usage 需两次 refresh 间隔才准确，持久化 System 复用基线
+        let mut system = state.system().lock().expect("sysinfo mutex poisoned");
+        system.refresh_processes(ProcessesToUpdate::All, true);
+        for id in &to_probe {
+            if let Some(snap) = registry.snapshot(*id) {
+                let ports = ports_map.get(id).cloned().unwrap_or_default();
+                results.push(probe_one(*id, &snap, &ports, &system, &sockets));
+            }
+        }
+    }
+
+    Ok(results)
+}
+
 // ===== 辅助 =====
 
 /// 更新 project 表的运行时缓存字段。
@@ -207,3 +265,35 @@ async fn wait_and_cleanup<R: Runtime>(app: &AppHandle<R>, project_id: i64) {
         let _ = update_runtime_cache(&pool, project_id, None, None, Some(&now_iso())).await;
     }
 }
+
+/// 批量取多个项目的 expected_ports，避免 probe 时 N+1 查询。
+///
+/// 一次 SQL `SELECT id, expected_ports FROM project WHERE id IN (...)`，
+/// expected_ports 为 JSON TEXT，手动反序列化为 `Vec<String>`。
+async fn fetch_expected_ports(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    ids: &[i64],
+) -> AppResult<HashMap<i64, Vec<String>>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = vec!["?"; ids.len()].join(",");
+    let sql = format!(
+        "SELECT id, expected_ports FROM project WHERE id IN ({placeholders})"
+    );
+    let mut q = sqlx::query(&sql);
+    for id in ids {
+        q = q.bind(id);
+    }
+    let rows = q.fetch_all(pool).await?;
+
+    let mut map = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let id: i64 = row.try_get("id")?;
+        let ports_json: String = row.try_get("expected_ports")?;
+        let ports: Vec<String> = serde_json::from_str(&ports_json).unwrap_or_default();
+        map.insert(id, ports);
+    }
+    Ok(map)
+}
+

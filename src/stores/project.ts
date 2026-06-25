@@ -1,10 +1,12 @@
-// project store：项目列表 CRUD + 本地运行态跟踪。
+// project store：项目列表 CRUD + 运行态实时探测（阶段 5）。
 //
-// 运行态说明：
-//   阶段 3 尚无「批量查询运行中项目」的后端命令（阶段 5 监控才会加），
-//   这里用一个本地 Set 记忆「当前 session 内被前端启动且尚未停止」的 project_id。
-//   初次加载时，若 DB 里 last_pid 不为空也不视为运行（重启 app 后 registry 必空），
-//   以 registry（后端进程注册表）为准 —— 阶段 5 会用真实探测替换此简化逻辑。
+// 运行态说明（阶段 5）：
+//   通过 `probe_statuses` 命令每 3s 轮询后端 registry 中的运行项目，
+//   返回的 statuses 是「项目 id → ProjectStatus」映射。不在映射中的项目视为 stopped。
+//   启停操作成功后立即 probeNow() 刷新一次，避免等下一轮（乐观更新 + 真实探测兜底）。
+//
+// 轮询生命周期由视图层控制：ProjectList onMounted 调 startPolling()，
+// onBeforeUnmount 调 stopPolling()。store 自身不感知组件生命周期。
 
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
@@ -15,21 +17,25 @@ import {
   deleteProject,
 } from '@/api/project'
 import { startProject, stopProject, restartProject } from '@/api/process'
+import { probeStatuses } from '@/api/monitor'
 import type { Project, ProjectInput } from '@/types/project'
+import type { HealthStatus, ProjectStatus } from '@/types/monitor'
 import { safeCall } from '@/api/invoke'
+
+/** 监控轮询间隔（ms），对齐开发计划 §5.4 的 3s 周期 */
+const POLL_INTERVAL_MS = 3000
 
 export const useProjectStore = defineStore('project', () => {
   const projects = ref<Project[]>([])
   const loading = ref(false)
 
-  /** 本地记忆的「运行中」project_id 集合（阶段 5 替换为真实探测） */
-  const runningIds = ref<Set<number>>(new Set())
+  /** 运行中项目的探测结果：project_id → ProjectStatus。不在表中的 id 视为 stopped。 */
+  const statuses = ref<Record<number, ProjectStatus>>({})
 
-  function setRunning(id: number, on: boolean) {
-    if (on) runningIds.value.add(id)
-    else runningIds.value.delete(id)
-    runningIds.value = new Set(runningIds.value)
-  }
+  /** 轮询定时器句柄（null 表示未在轮询） */
+  let pollTimer: ReturnType<typeof setInterval> | null = null
+  /** 防止并发 probe（上一轮未完成时跳过） */
+  let probing = false
 
   function updateProjectMeta(id: number, pid: number | null, startedAt: string | null) {
     const idx = projects.value.findIndex((x) => x.id === id)
@@ -64,38 +70,81 @@ export const useProjectStore = defineStore('project', () => {
     return p
   }
 
-  /** 删除项目（运行中拒绝，见 ensureStopped） */
+  /** 删除项目 */
   async function remove(id: number) {
     await deleteProject(id)
     projects.value = projects.value.filter((p) => p.id !== id)
-    runningIds.value.delete(id)
+    delete statuses.value[id]
   }
 
-  /** 启动项目：成功后记入 runningIds */
+  /** 启动项目：乐观标记后立即探测确认 */
   async function start(id: number) {
     const r = await startProject(id)
-    setRunning(id, true)
     updateProjectMeta(id, r.root_pid, r.started_at)
+    // 立即探测刷新状态（不等下一轮 3s）
+    void probeNow()
     return r
   }
 
-  /** 停止项目：移出 runningIds */
+  /** 停止项目：移出 statuses 后立即探测确认 */
   async function stop(id: number) {
     await stopProject(id)
-    setRunning(id, false)
+    delete statuses.value[id]
     updateProjectMeta(id, null, null)
+    void probeNow()
   }
 
   /** 重启：stop → start */
   async function restart(id: number) {
     const r = await restartProject(id)
-    setRunning(id, true)
     updateProjectMeta(id, r.root_pid, r.started_at)
+    void probeNow()
     return r
   }
 
+  // ===== 运行态探测（阶段 5） =====
+
+  /** 立即拉取一次运行态（重入安全：上一轮未完成则跳过） */
+  async function probeNow() {
+    if (probing) return
+    probing = true
+    try {
+      const list = await probeStatuses()
+      const map: Record<number, ProjectStatus> = {}
+      for (const s of list) map[s.project_id] = s
+      statuses.value = map
+    } catch (e) {
+      // 探测失败不应打断 UI；下次轮询重试
+      console.warn('probe_statuses 失败:', e)
+    } finally {
+      probing = false
+    }
+  }
+
+  /** 启动 3s 轮询（幂等：已运行则忽略） */
+  function startPolling() {
+    if (pollTimer !== null) return
+    void probeNow()
+    pollTimer = setInterval(() => void probeNow(), POLL_INTERVAL_MS)
+  }
+
+  /** 停止轮询 */
+  function stopPolling() {
+    if (pollTimer !== null) {
+      clearInterval(pollTimer)
+      pollTimer = null
+    }
+  }
+
+  /** 取某项目的健康状态（无探测结果 → stopped） */
+  function getHealth(id: number): HealthStatus {
+    return statuses.value[id]?.health ?? 'stopped'
+  }
+
+  /** 是否运行中（running 或 running_abnormal） */
   function isRunning(id: number): boolean {
-    return runningIds.value.has(id)
+    const h = getHealth(id)
+    return h === 'running' || h === 'running_abnormal'
   }
 
   /** 安全执行任一 action，返回 [data, error] 二元组 */
@@ -113,7 +162,7 @@ export const useProjectStore = defineStore('project', () => {
   return {
     projects,
     loading,
-    runningIds,
+    statuses,
     fetchAll,
     add,
     patch,
@@ -121,6 +170,10 @@ export const useProjectStore = defineStore('project', () => {
     start,
     stop,
     restart,
+    probeNow,
+    startPolling,
+    stopPolling,
+    getHealth,
     isRunning,
     safe,
     onGroupDeleted,
