@@ -9,7 +9,7 @@ import { resolve } from 'node:path'
 const host = process.env.TAURI_DEV_HOST
 
 // https://vitejs.dev/config/
-export default defineConfig(async () => ({
+export default defineConfig(() => ({
   plugins: [
     vue(),
     AutoImport({
