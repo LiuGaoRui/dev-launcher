@@ -1,0 +1,42 @@
+[package]
+name = "dev-launcher"
+version = "0.1.0"
+description = "DevLauncher - 开发机项目管理器"
+authors = ["DevLauncher"]
+edition = "2021"
+rust-version = "1.78"
+
+# Tauri 要求的库入口
+[lib]
+name = "dev_launcher_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-sql = { version = "2", features = ["sqlite"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+sysinfo = "0.32"
+netstat2 = "0.9"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+] }
+
+[features]
+# 默认使用自定义协议（production build）
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

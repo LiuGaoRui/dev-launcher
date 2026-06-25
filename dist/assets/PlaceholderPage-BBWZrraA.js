@@ -1,0 +1,1 @@
+import{d as t,o as n,a as s,b as c,E as _,_ as a}from"./index-CH0WCVLU.js";const p={class:"placeholder"},r=t({__name:"PlaceholderPage",props:{description:{}},setup(e){return(i,d)=>{const o=_;return n(),s("div",p,[c(o,{description:e.description},null,8,["description"])])}}}),m=a(r,[["__scopeId","data-v-ebf7ab21"]]);export{m as _};
