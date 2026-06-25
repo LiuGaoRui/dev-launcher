@@ -16,12 +16,15 @@ use tokio::process::{Child, Command};
 
 /// Windows CREATE_NO_WINDOW 标志，避免子进程弹出控制台窗口。
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// 清洗项目名为合法目录名：非 [A-Za-z0-9_\u4e00-\u9fa5-] 字符替换为 `_`。
 ///
 /// 保留中文字符（\u4e00-\u9fa5 CJK 统一表意文字基本区），Windows 文件系统支持。
-fn sanitize_name(name: &str) -> String {
+///
+/// 跨模块复用：spawn（写日志）与 logs/paths（读/列日志）须用同一规则拼目录名，
+/// 否则读写路径会错位。故提升为 pub。
+pub fn sanitize_name(name: &str) -> String {
     name.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric()

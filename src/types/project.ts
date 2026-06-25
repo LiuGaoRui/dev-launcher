@@ -70,3 +70,20 @@ export interface StartResult {
   log_path: string
   started_at: string
 }
+
+/**
+ * 构建输出事件（对齐 Rust `BuildEvent`，serde tag=kind/content=data）。
+ *
+ * kind=stdout/stderr 时 data 为文本；kind=exit 时 data 为退出码（数字）。
+ * 前端用 discriminated union 收窄 data 类型。
+ */
+export type BuildEvent =
+  | { kind: 'stdout'; data: string }
+  | { kind: 'stderr'; data: string }
+  | { kind: 'exit'; data: number }
+
+/** build_project 的返回值（对齐 Rust `BuildResult`） */
+export interface BuildResult {
+  exit_code: number
+  duration_ms: number
+}

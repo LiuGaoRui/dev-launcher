@@ -8,11 +8,13 @@ use std::time::Duration;
 
 use sqlx::Row;
 use sysinfo::ProcessesToUpdate;
+use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, Runtime};
 
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::models::now_iso;
+use crate::process::build::{run_build, BuildEvent, BuildResult};
 use crate::process::job_object::JobHandle;
 use crate::process::monitor::{collect_tcp_sockets, probe_one, ProjectStatus};
 use crate::process::registry::RunningProcess;
@@ -140,6 +142,24 @@ pub async fn restart_project<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResul
         stop_project(app.clone(), id).await?;
     }
     start_project(app, id).await
+}
+
+/// 构建项目：执行 build_cmd，stdout/stderr 实时推 Channel，跑完返回退出码与耗时。
+///
+/// 与 start_project 的区别：一次性进程（不入 registry、不用 Job Object），
+/// stdout/stderr 走 piped 实时推前端（不写日志文件），由 BuildResult 返回退出码。
+///
+/// 命令会 await 到构建结束才返回；构建中前端关闭 Channel → 读取 task 退出 →
+/// kill_on_drop 兜底回收子进程。
+#[tauri::command]
+pub async fn build_project<R: Runtime>(
+    app: AppHandle<R>,
+    id: i64,
+    on_event: Channel<BuildEvent>,
+) -> AppResult<BuildResult> {
+    let pool = db::pool(&app)?;
+    let project = ProjectService::get(&pool, id).await?;
+    run_build(&project, on_event).await
 }
 
 /// 探测项目运行态（CPU/内存/端口），阶段 5 监控面板用。

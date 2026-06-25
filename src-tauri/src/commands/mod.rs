@@ -4,5 +4,6 @@
 //! 命令签名对齐 docs/03-命令清单.md。
 
 pub mod group;
+pub mod log;
 pub mod process;
 pub mod project;

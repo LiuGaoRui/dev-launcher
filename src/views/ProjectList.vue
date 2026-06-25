@@ -6,15 +6,20 @@
 // 编排：所有 store 操作在本页面集中进行，卡片组件无状态。
 
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useGroupStore } from '@/stores/group'
 import { useProjectStore } from '@/stores/project'
+import { useBuildStore } from '@/stores/build'
 import type { Project, ProjectInput } from '@/types/project'
 import ProjectCard from '@/components/project/ProjectCard.vue'
 import ProjectFormDialog from '@/components/project/ProjectFormDialog.vue'
+import BuildDialog from '@/components/project/BuildDialog.vue'
 
 const groupStore = useGroupStore()
 const projectStore = useProjectStore()
+const buildStore = useBuildStore()
+const router = useRouter()
 
 // ===== 筛选 =====
 
@@ -76,9 +81,15 @@ onMounted(async () => {
 })
 onBeforeUnmount(() => {
   projectStore.stopPolling()
+  buildStore.reset()
 })
 
 // ===== 启停重启 =====
+
+/** 点击卡片主体进入项目详情（日志面板） */
+function openDetail(p: Project) {
+  router.push({ name: 'ProjectDetail', params: { id: p.id } })
+}
 
 async function handleStart(p: Project) {
   const [, err] = await withBusy(p.id, () => projectStore.start(p.id))
@@ -96,6 +107,71 @@ async function handleRestart(p: Project) {
   const [, err] = await withBusy(p.id, () => projectStore.restart(p.id))
   if (err) ElMessage.error(`重启失败：${err}`)
   else ElMessage.success(`「${p.name}」已重启`)
+}
+
+// ===== 构建 / 一键发布（阶段 7） =====
+
+/** 构建对话框显隐 + 当前构建项目 */
+const buildDialogVisible = ref(false)
+const buildProjectName = ref('')
+
+/** 打开构建对话框并启动构建 */
+async function handleBuild(p: Project) {
+  if (!p.build_cmd?.trim()) {
+    ElMessage.warning('该项目未配置构建命令')
+    return
+  }
+  buildProjectName.value = p.name
+  buildDialogVisible.value = true
+  await buildStore.startBuild(p.id)
+}
+
+/**
+ * 一键发布：stop → build →（构建成功则）start。
+ * 编排逻辑放前端（IPC 边界原则 §4.2：Rust 只做原子操作，组合在前端）。
+ */
+async function handleDeploy(p: Project) {
+  if (!p.build_cmd?.trim()) {
+    ElMessage.warning('该项目未配置构建命令')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      `确定一键发布「${p.name}」吗？将执行：停止 → 构建 → 启动。`,
+      '一键发布',
+      { type: 'info', confirmButtonText: '发布', cancelButtonText: '取消' },
+    )
+  } catch {
+    return // 取消
+  }
+
+  // 弹构建日志对话框（整个发布过程可见输出）
+  buildProjectName.value = p.name
+  buildDialogVisible.value = true
+
+  // 1. 停止（若在运行）
+  if (projectStore.isRunning(p.id)) {
+    const [, stopErr] = await withBusy(p.id, () => projectStore.stop(p.id))
+    if (stopErr) {
+      ElMessage.error(`停止失败，已中止发布：${stopErr}`)
+      return
+    }
+  }
+
+  // 2. 构建（startBuild 返回的 Promise 在构建结束时 resolve）
+  const buildResult = await buildStore.startBuild(p.id)
+  if (!buildResult || buildResult.exit_code !== 0) {
+    ElMessage.error(`构建失败（退出码 ${buildStore.exitCode}），已中止发布`)
+    return
+  }
+
+  // 3. 启动
+  const [, startErr] = await withBusy(p.id, () => projectStore.start(p.id))
+  if (startErr) {
+    ElMessage.error(`构建成功但启动失败：${startErr}`)
+    return
+  }
+  ElMessage.success(`「${p.name}」发布完成`)
 }
 
 // ===== 删除 =====
@@ -195,8 +271,11 @@ async function handleSubmitForm(input: ProjectInput, origin: Project | null) {
           @start="handleStart(p)"
           @stop="handleStop(p)"
           @restart="handleRestart(p)"
+          @build="handleBuild(p)"
+          @deploy="handleDeploy(p)"
           @edit="openEdit(p)"
           @delete="handleDelete(p)"
+          @open="openDetail(p)"
         />
       </template>
       <el-empty
@@ -214,6 +293,12 @@ async function handleSubmitForm(input: ProjectInput, origin: Project | null) {
       :default-group-id="activeGroup && activeGroup > 0 ? activeGroup : null"
       :submitting="submitting"
       @submit="handleSubmitForm"
+    />
+
+    <!-- 构建日志对话框（阶段 7） -->
+    <BuildDialog
+      v-model="buildDialogVisible"
+      :project-name="buildProjectName"
     />
   </div>
 </template>

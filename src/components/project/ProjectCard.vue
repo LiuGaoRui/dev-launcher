@@ -27,6 +27,8 @@ const emit = defineEmits<{
   start: []
   stop: []
   restart: []
+  build: []
+  deploy: []
   edit: []
   delete: []
   /** 点击卡片主体（进入详情，阶段 4+ 实现） */
@@ -41,6 +43,9 @@ const running = computed(() => health.value !== 'stopped')
 
 /** 实时 PID（优先 status.pid，回退 project.last_pid 缓存） */
 const pid = computed(() => props.status?.pid ?? props.project.last_pid ?? null)
+
+/** 是否配置了构建命令（控制构建/发布按钮可用性） */
+const canBuild = computed(() => !!props.project.build_cmd?.trim())
 
 /** 端口列表展示为逗号分隔，空则显示 「-」 */
 function portsText(p: Project): string {
@@ -89,9 +94,12 @@ function portsText(p: Project): string {
         <ActionBar
           :running="running"
           :busy="props.busy"
+          :can-build="canBuild"
           @start="emit('start')"
           @stop="emit('stop')"
           @restart="emit('restart')"
+          @build="emit('build')"
+          @deploy="emit('deploy')"
           @edit="emit('edit')"
           @delete="emit('delete')"
         />

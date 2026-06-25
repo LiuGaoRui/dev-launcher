@@ -5,6 +5,7 @@
 mod commands;
 mod db;
 mod error;
+mod logs;
 mod models;
 mod process;
 mod services;
@@ -53,7 +54,13 @@ pub fn run() {
             commands::process::start_project,
             commands::process::stop_project,
             commands::process::restart_project,
+            commands::process::build_project,
             commands::process::probe_statuses,
+            // log
+            commands::log::subscribe_log,
+            commands::log::read_log_history,
+            commands::log::list_log_dates,
+            commands::log::clear_log,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
