@@ -86,6 +86,9 @@ pub async fn start_project<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResult<
 }
 
 /// 停止项目：Job 优先杀整树 → 轮询 ActiveProcesses 归零（最多 5s）→ 兜底 kill child → 清理。
+///
+/// 若 job.terminate 失败，提前返回错误且**不从 registry 移除**（保留条目供重试/诊断），
+/// 避免进程变孤儿无人管理。terminate 成功才进入清理流程。
 #[tauri::command]
 pub async fn stop_project<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResult<()> {
     let state = app.state::<AppState>();
@@ -94,11 +97,12 @@ pub async fn stop_project<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResult<(
         return Err(AppError::NotRunning(id));
     }
 
-    // 先调 job.terminate（持锁短暂，不 await）
+    // 先调 job.terminate（持锁短暂，不 await）。失败则保留 registry 条目，提前返回错误。
     let terminate_ok = state
         .registry()
         .with_mut(id, |p| p.job.terminate())
         .unwrap_or(Ok(()));
+    terminate_ok?;
 
     // 轮询 ActiveProcesses 归零
     let mut waited = 0u64;
@@ -122,10 +126,8 @@ pub async fn stop_project<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResult<(
         waited += TERMINATE_POLL_INTERVAL_MS;
     }
 
-    // 显式移除（drop child 触发 kill_on_drop，drop job 触发 CloseHandle → 已无进程）
+    // terminate 已成功：显式移除（drop child 触发 kill_on_drop，drop job 触发 CloseHandle → 已无进程）
     state.registry().remove(id);
-
-    terminate_ok?;
 
     // 更新 DB last_stop_time
     let pool = db::pool(&app)?;

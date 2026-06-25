@@ -48,7 +48,8 @@ onMounted(async () => {
   }
   project.value = p
 
-  // 列页若没在轮询则启动（详情页复用同一轮询拿本项目状态）
+  // 确保轮询在运行（幂等：列表页已启动则 no-op；直接进详情页则在此启动）。
+  // 注意：不在此 stopPolling —— 轮询是全局共享的，由列表页管生命周期。
   projectStore.startPolling()
 
   // 默认进入实时模式

@@ -17,9 +17,11 @@ pub struct AppState {
 }
 
 struct Inner {
-    /// 应用数据目录（如 %APPDATA%\com.devlauncher.app）
+    /// 应用数据目录（如 %APPDATA%\com.devlauncher.app）。
+    /// 当前仅用于派生 logs_root，保留字段供未来扩展（构建产物目录、DB 路径等）。
+    #[allow(dead_code)]
     data_dir: std::path::PathBuf,
-    /// 日志根目录
+    /// 日志根目录（data_dir/logs）
     logs_root: std::path::PathBuf,
     /// 运行中进程注册表
     registry: ProcessRegistry,
@@ -49,6 +51,7 @@ impl AppState {
         })
     }
 
+    #[allow(dead_code)]
     pub fn data_dir(&self) -> &std::path::Path {
         &self.inner.data_dir
     }

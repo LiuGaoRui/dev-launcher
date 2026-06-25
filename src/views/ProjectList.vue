@@ -115,7 +115,7 @@ async function handleRestart(p: Project) {
 const buildDialogVisible = ref(false)
 const buildProjectName = ref('')
 
-/** 打开构建对话框并启动构建 */
+/** 打开构建对话框并启动构建。构建期间标记 busy 禁用卡片操作条。 */
 async function handleBuild(p: Project) {
   if (!p.build_cmd?.trim()) {
     ElMessage.warning('该项目未配置构建命令')
@@ -123,12 +123,18 @@ async function handleBuild(p: Project) {
   }
   buildProjectName.value = p.name
   buildDialogVisible.value = true
-  await buildStore.startBuild(p.id)
+  setBusy(p.id, true)
+  try {
+    await buildStore.startBuild(p.id)
+  } finally {
+    setBusy(p.id, false)
+  }
 }
 
 /**
  * 一键发布：stop → build →（构建成功则）start。
  * 编排逻辑放前端（IPC 边界原则 §4.2：Rust 只做原子操作，组合在前端）。
+ * 全程用 busy 标记该项目，禁用卡片操作条避免并发操作。
  */
 async function handleDeploy(p: Project) {
   if (!p.build_cmd?.trim()) {
@@ -149,29 +155,35 @@ async function handleDeploy(p: Project) {
   buildProjectName.value = p.name
   buildDialogVisible.value = true
 
-  // 1. 停止（若在运行）
-  if (projectStore.isRunning(p.id)) {
-    const [, stopErr] = await withBusy(p.id, () => projectStore.stop(p.id))
-    if (stopErr) {
-      ElMessage.error(`停止失败，已中止发布：${stopErr}`)
+  // 全程标记 busy，禁用卡片操作条防并发
+  setBusy(p.id, true)
+  try {
+    // 1. 停止（若在运行）
+    if (projectStore.isRunning(p.id)) {
+      const [, stopErr] = await projectStore.safe(() => projectStore.stop(p.id))
+      if (stopErr) {
+        ElMessage.error(`停止失败，已中止发布：${stopErr}`)
+        return
+      }
+    }
+
+    // 2. 构建（startBuild 返回的 Promise 在构建结束时 resolve）
+    const buildResult = await buildStore.startBuild(p.id)
+    if (!buildResult || buildResult.exit_code !== 0) {
+      ElMessage.error(`构建失败（退出码 ${buildStore.exitCode}），已中止发布`)
       return
     }
-  }
 
-  // 2. 构建（startBuild 返回的 Promise 在构建结束时 resolve）
-  const buildResult = await buildStore.startBuild(p.id)
-  if (!buildResult || buildResult.exit_code !== 0) {
-    ElMessage.error(`构建失败（退出码 ${buildStore.exitCode}），已中止发布`)
-    return
+    // 3. 启动
+    const [, startErr] = await projectStore.safe(() => projectStore.start(p.id))
+    if (startErr) {
+      ElMessage.error(`构建成功但启动失败：${startErr}`)
+      return
+    }
+    ElMessage.success(`「${p.name}」发布完成`)
+  } finally {
+    setBusy(p.id, false)
   }
-
-  // 3. 启动
-  const [, startErr] = await withBusy(p.id, () => projectStore.start(p.id))
-  if (startErr) {
-    ElMessage.error(`构建成功但启动失败：${startErr}`)
-    return
-  }
-  ElMessage.success(`「${p.name}」发布完成`)
 }
 
 // ===== 删除 =====

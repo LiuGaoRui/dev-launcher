@@ -95,11 +95,13 @@ pub async fn clear_log<R: Runtime>(
     let date = date.unwrap_or_else(paths::today);
     let path = paths::date_log_path(&logs_root, &project.name, &date);
 
-    // truncate：清空内容；文件不存在则创建空文件
-    OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .create(true)
-        .open(&path)?;
+    // 仅对已存在文件 truncate 清空内容（不创建新文件，避免 list_log_dates
+    // 列出不存在的空日期）。文件不存在视为 no-op。
+    if path.exists() {
+        OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)?;
+    }
     Ok(())
 }
