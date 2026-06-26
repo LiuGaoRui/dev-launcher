@@ -173,6 +173,28 @@ fn check_port(
     (listening, owned)
 }
 
+/// 端口发现：查某端口是否处于 LISTEN，返回占用者 PID（首个 associated_pid）。
+///
+/// 与 `check_port` 的区别：`check_port` 已知本项目进程树、仅校验归属；
+/// 本函数用于**未知**占用者的发现场景——外部启动的进程（如 VSCode 终端 npm dev）
+/// 没有写入 registry / DB last_pid，需通过端口反查其 PID 才能接管。
+///
+/// 返回 None 的情况：端口非数字、无 LISTEN、或 netstat 未给出关联 PID。
+pub fn find_port_owner(port: &str, sockets: &[netstat2::SocketInfo]) -> Option<u32> {
+    let port_u16: u16 = port.trim().parse().ok()?;
+    for si in sockets {
+        if let ProtocolSocketInfo::Tcp(tcp) = &si.protocol_socket_info {
+            if tcp.local_port == port_u16 && tcp.state == TcpState::Listen {
+                // 取首个关联 PID 即可（同一端口多 PID 极罕见，且仅需定位进程）
+                if let Some(pid) = si.associated_pids.first() {
+                    return Some(*pid);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// 查询系统全部 TCP（v4+v6）socket 一次，供所有项目复用。
 ///
 /// 失败时返回空表（监控不应因单次 netstat 失败中断整个 probe）。
@@ -216,6 +238,12 @@ mod tests {
         let (listening, owned) = check_port("abc", &pids, &[]);
         assert!(!listening);
         assert!(!owned);
+    }
+
+    #[test]
+    fn find_port_owner_none_for_non_numeric_or_empty() {
+        assert_eq!(find_port_owner("abc", &[]), None);
+        assert_eq!(find_port_owner("8080", &[]), None);
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! 签名对齐 docs/03-命令清单.md §四。
 //! 从 AppState 取 registry + logs_root + system，从 AppHandle 取 DB pool。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -20,7 +20,7 @@ use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::models::now_iso;
 use crate::process::build::{run_build, BuildEvent, BuildResult};
-use crate::process::monitor::{collect_tcp_sockets, probe_one, ProjectStatus};
+use crate::process::monitor::{collect_tcp_sockets, find_port_owner, probe_one, ProjectStatus};
 use crate::process::registry::{ProcessSnapshot, RunningProcess};
 use crate::process::spawn::{log_file_path, spawn_command};
 use crate::process::StartResult;
@@ -50,6 +50,20 @@ pub async fn start_project<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResult<
     if let Some(last_pid) = project.last_pid {
         let system = state.system().lock().expect("sysinfo mutex poisoned");
         if pid_alive(last_pid as u32, &system) {
+            return Err(AppError::AlreadyRunning(id));
+        }
+    }
+
+    // 端口预检：若预期端口已被监听（如用户在 VSCode 终端 npm dev 启动），
+    // 拒绝 spawn 以免 dev server 发现端口被占后递增端口（Vite/Next 行为）。
+    // 此处不区分占用者是否为本项目——端口已被占即不应再启动重复实例。
+    if !project.expected_ports.is_empty() {
+        let sockets = collect_tcp_sockets();
+        if project
+            .expected_ports
+            .iter()
+            .any(|p| find_port_owner(p, &sockets).is_some())
+        {
             return Err(AppError::AlreadyRunning(id));
         }
     }
@@ -95,20 +109,24 @@ pub async fn start_project<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResult<
 
 /// 停止项目：用 `taskkill /F /T /PID` 杀整树，兼顾本会话进程与重开接管的外部进程。
 ///
-/// pid 来源：registry 有该项目 → 用 registry 的 pid；否则查 DB 的 last_pid。
-/// 两者皆无 → `NotRunning`。
+/// pid 来源（三级回退）：
+/// 1. registry 有该项目 → 用 registry 的 pid（本会话进程）
+/// 2. DB last_pid 非空 → 用其 pid（重开接管 / probe 发现写入的外部进程）
+/// 3. expected_ports 端口发现 → 用占用者 pid（兜底：probe 尚未运行的间隙）
+/// 三者皆无 → `NotRunning`。
 ///
 /// 杀树后：registry 有该项目则移除（drop child，因无 kill_on_drop，安全无副作用），
 /// 并更新 DB last_stop_time + 清空 last_pid。
 #[tauri::command]
 pub async fn stop_project<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResult<()> {
     let state = app.state::<AppState>();
+    let pool = db::pool(&app)?;
 
-    // 取 pid：registry 优先（本会话进程），否则查 DB（重开接管的外部进程）
+    // 取 pid：registry 优先（本会话进程）
     let pid: u32 = if let Some(snap) = state.registry().snapshot(id) {
         snap.pid
     } else {
-        let pool = db::pool(&app)?;
+        // DB last_pid（重开接管 / probe 发现写入的外部进程）
         let last_pid: Option<i64> = sqlx::query_scalar(
             "SELECT last_pid FROM project WHERE id = ?",
         )
@@ -116,9 +134,28 @@ pub async fn stop_project<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResult<(
         .fetch_optional(&pool)
         .await?
         .flatten();
-        match last_pid {
-            Some(p) => p as u32,
-            None => return Err(AppError::NotRunning(id)),
+        if let Some(p) = last_pid {
+            p as u32
+        } else {
+            // 端口发现兜底：查 expected_ports 的占用者（覆盖 probe 尚未运行的间隙）
+            let ports_json: Option<String> = sqlx::query_scalar(
+                "SELECT expected_ports FROM project WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_optional(&pool)
+            .await?;
+            let ports: Vec<String> = ports_json
+                .as_deref()
+                .and_then(|j| serde_json::from_str(j).ok())
+                .unwrap_or_default();
+            if ports.is_empty() {
+                return Err(AppError::NotRunning(id));
+            }
+            let sockets = collect_tcp_sockets();
+            match ports.iter().find_map(|p| find_port_owner(p, &sockets)) {
+                Some(p) => p,
+                None => return Err(AppError::NotRunning(id)),
+            }
         }
     };
 
@@ -129,18 +166,26 @@ pub async fn stop_project<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResult<(
     state.registry().remove(id);
 
     // 更新 DB last_stop_time + 清空 last_pid
-    let pool = db::pool(&app)?;
     clear_runtime_after_stop(&pool, id).await?;
 
     Ok(())
 }
 
 /// 重启：stop → start。必须确认旧进程完全退出后再启动，否则端口占用。
+///
+/// 始终尝试 stop（容忍未运行的 `NotRunning` 错误），覆盖三种运行来源：
+/// registry 本会话进程 / DB last_pid 外部进程 / 端口发现的外部进程。
+/// stop 后短暂等待端口释放，避免 start 预检误判端口仍被占用。
 #[tauri::command]
 pub async fn restart_project<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResult<StartResult> {
-    // 若正在运行则先停止（stop 内部已校验 NotRunning，这里容忍未运行直接 start）
-    if app.state::<AppState>().registry().contains(id) {
-        stop_project(app.clone(), id).await?;
+    // 先停止（容忍未运行）；stop 内部按 registry → DB last_pid → 端口发现三级回退定位 pid
+    match stop_project(app.clone(), id).await {
+        Ok(()) => {
+            // 等待端口释放：taskkill 异步回收，立即 start 可能预检命中残留 LISTEN
+            tokio::time::sleep(Duration::from_millis(WAIT_CLEANUP_INTERVAL_MS)).await;
+        }
+        Err(AppError::NotRunning(_)) => { /* 未运行，直接启动 */ }
+        Err(e) => return Err(e),
     }
     start_project(app, id).await
 }
@@ -185,7 +230,7 @@ pub async fn probe_statuses<R: Runtime>(
     let pool = db::pool(&app)?;
 
     // 候选集 + DB 运行时信息
-    let (mut candidates, runtime_map) = match ids {
+    let (mut candidates, mut runtime_map) = match ids.as_ref() {
         Some(v) if !v.is_empty() => {
             // 定向探测：仅对不在 registry 中的候选查 DB
             let db_only: Vec<i64> = v
@@ -194,7 +239,7 @@ pub async fn probe_statuses<R: Runtime>(
                 .copied()
                 .collect();
             let runtime_map = fetch_runtime_info(&pool, &db_only, state.logs_root()).await?;
-            (v, runtime_map)
+            (v.clone(), runtime_map)
         }
         _ => {
             // 全量扫描：registry 内项目 + DB 全部 last_pid 非空的项目
@@ -210,15 +255,61 @@ pub async fn probe_statuses<R: Runtime>(
     };
     candidates.sort_unstable();
 
-    if candidates.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // 批量取 expected_ports（一次 SQL）
-    let ports_map = fetch_expected_ports(&pool, &candidates).await?;
+    // 批量取全部项目的 expected_ports（端口发现需扫描全部项目，一次 SQL）
+    let ports_map = fetch_all_expected_ports(&pool).await?;
 
     // TCP 全表一次查（不依赖 system，放在锁外减少临界区）
     let sockets = collect_tcp_sockets();
+
+    // ===== 端口驱动的进程发现 =====
+    // 对不在候选集中、但有 expected_ports 的项目，按端口反查 TCP LISTEN 占用者。
+    // 命中则将占用者 PID 写回 DB last_pid 并补入候选集，后续 probe 循环自然接管展示。
+    // 覆盖「外部启动」（如 VSCode 终端 npm dev）——此类进程无 registry/DB 记录，
+    // 只能通过端口发现。**必须在 candidates.is_empty() 早退之前执行**，否则外部启动
+    // 的项目永远不会进入候选集，发现逻辑被跳过。
+    if !ports_map.is_empty() {
+        let candidate_set: HashSet<i64> = candidates.iter().copied().collect();
+        // discovered: (project_id, owner_pid)
+        let mut discovered: Vec<(i64, u32)> = Vec::new();
+        for (pid_candidate, ports) in &ports_map {
+            if candidate_set.contains(pid_candidate) {
+                continue; // 已在候选集，无需发现
+            }
+            // 任一预期端口被监听即视为本项目已外部启动
+            if let Some(owner) = ports
+                .iter()
+                .find_map(|p| find_port_owner(p, &sockets))
+            {
+                discovered.push((*pid_candidate, owner));
+            }
+        }
+        if !discovered.is_empty() {
+            // 写回 DB last_pid 并补入候选集，使后续 probe 能通过 runtime_map 路径展示。
+            let now = now_iso();
+            let discovered_ids: Vec<i64> = discovered.iter().map(|(id, _)| *id).collect();
+            for (did, owner) in &discovered {
+                let _ = sqlx::query(
+                    "UPDATE project SET last_pid = ?, last_start_time = ?, update_time = datetime('now') WHERE id = ?",
+                )
+                .bind(*owner as i64)
+                .bind(&now)
+                .bind(did)
+                .execute(&pool)
+                .await;
+            }
+            // 补取新发现项目的 runtime info，合入 runtime_map
+            let extra = fetch_runtime_info(&pool, &discovered_ids, state.logs_root()).await?;
+            for (k, v) in extra {
+                runtime_map.insert(k, v);
+            }
+            candidates.extend(discovered_ids);
+            candidates.sort_unstable();
+        }
+    }
+
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
 
     // 刷新系统进程（cpu 基线）并逐项目 probe
     let mut results = Vec::with_capacity(candidates.len());
@@ -323,33 +414,26 @@ fn in_placeholders(n: usize) -> String {
     (0..n).map(|_| "?").collect::<Vec<_>>().join(",")
 }
 
-/// 批量取多个项目的 expected_ports，避免 probe 时 N+1 查询。
+/// 查询全部项目的 expected_ports（用于端口驱动的进程发现）。
 ///
-/// 一次 SQL `SELECT id, expected_ports FROM project WHERE id IN (...)`，
+/// 一次 SQL `SELECT id, expected_ports FROM project` 扫描所有项目，
 /// expected_ports 为 JSON TEXT，手动反序列化为 `Vec<String>`。
-async fn fetch_expected_ports(
+/// 仅返回 expected_ports 非空的项目，供 probe_statuses 的发现逻辑按端口反查占用者。
+async fn fetch_all_expected_ports(
     pool: &sqlx::Pool<sqlx::Sqlite>,
-    ids: &[i64],
 ) -> AppResult<HashMap<i64, Vec<String>>> {
-    if ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let sql = format!(
-        "SELECT id, expected_ports FROM project WHERE id IN ({})",
-        in_placeholders(ids.len())
-    );
-    let mut q = sqlx::query(&sql);
-    for id in ids {
-        q = q.bind(id);
-    }
-    let rows = q.fetch_all(pool).await?;
+    let rows = sqlx::query("SELECT id, expected_ports FROM project")
+        .fetch_all(pool)
+        .await?;
 
     let mut map = HashMap::with_capacity(rows.len());
     for row in rows {
         let id: i64 = row.try_get("id")?;
         let ports_json: String = row.try_get("expected_ports")?;
         let ports: Vec<String> = serde_json::from_str(&ports_json).unwrap_or_default();
-        map.insert(id, ports);
+        if !ports.is_empty() {
+            map.insert(id, ports);
+        }
     }
     Ok(map)
 }
