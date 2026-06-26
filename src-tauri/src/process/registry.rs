@@ -2,19 +2,23 @@
 //!
 //! `Mutex<HashMap<i64, RunningProcess>>`，key 为 project_id。
 //! 提供 insert/remove/contains/snapshot 等操作，锁粒度尽量小。
-//! RunningProcess 持有 tokio Child + JobHandle，drop 时自动回收（kill_on_drop + KILL_ON_JOB_CLOSE）。
+//!
+//! RunningProcess 仅持有 tokio Child（本会话进程退出检测用）；
+//! 进程脱离管理器生命周期（不设 kill_on_drop、无 Job Object），
+//! 故 drop Child 不会杀死子进程。停止改由 stop_project 的 taskkill /F /T 完成。
 
 use crate::error::{AppError, AppResult};
-use crate::process::job_object::JobHandle;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tokio::process::Child;
 
 /// 一个运行中的项目进程。
+///
+/// 仅记录本会话内 spawn 的进程（用于退出检测 + 更新 DB）。
+/// 重开软件后接管的外部进程不在此处，由 probe_statuses 经 DB last_pid 验活展示。
 pub struct RunningProcess {
     pub child: Child,
-    pub job: JobHandle,
     pub pid: u32,
     pub log_path: PathBuf,
     pub started_at: String,
@@ -107,19 +111,15 @@ mod tests {
     use super::*;
     use std::process::Stdio;
 
-    /// 构造一个最小化的 RunningProcess（不含真实 Child/Job，用 mock）。
-    ///
-    /// 注意：JobHandle::new() 会真实创建 Job Object，但单元测试无需 spawn 真进程。
+    /// 构造一个最小化的 RunningProcess（不含真实 Child，用 dummy 进程占位）。
     fn make_proc(pid: u32) -> RunningProcess {
-        // 用一个立即退出的 dummy 进程占位 child（ping 之类不实际启动，仅占位结构）。
-        // 这里用一个会立即结束的命令，确保 child 字段合法。
+        // 用一个立即退出的 dummy 进程占位 child，确保 child 字段合法。
         let mut cmd = tokio::process::Command::new("cmd");
         cmd.arg("/C").arg("exit 0");
         cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         let child = cmd.spawn().expect("spawn dummy child");
         RunningProcess {
             child,
-            job: JobHandle::new().expect("create job"),
             pid,
             log_path: PathBuf::from("/tmp/test.log"),
             started_at: "2026-01-01 00:00:00".into(),

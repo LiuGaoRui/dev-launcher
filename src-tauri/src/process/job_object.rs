@@ -1,6 +1,10 @@
 //! Windows Job Object 封装（unsafe FFI）
 //!
-//! 设计要点（见 ADR-001 / 调研结论）：
+//! 历史背景（见 ADR-001）：曾用 `KILL_ON_JOB_CLOSE` 让进程随管理器退出而终止。
+//! 现**已停用**——为支持「关闭软件后进程继续运行」，start_project 不再挂 Job Object。
+//! 文件与 FFI 封装保留，供未来可能的需求（如「随软件退出」的可选开关）复用。
+//!
+//! 设计要点（原）：
 //! - 用 `Owned<HANDLE>` 做 RAII：drop 时自动 `CloseHandle`，配合
 //!   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 自动杀掉 Job 内全部进程（含后代）
 //! - 杀树可靠性依赖 Job Object，而非 `taskkill /T`
@@ -8,6 +12,8 @@
 //!
 //! HANDLE 内部是裸指针（非 Send/Sync），但 Job 句柄在单线程内使用、
 //! 通过 Mutex 串行访问，故 `JobHandle` 显式 unsafe impl Send/Sync。
+
+#![allow(dead_code, unused_imports)] // 停用但保留封装，避免未使用告警
 
 use crate::error::{AppError, AppResult};
 use std::mem::size_of;

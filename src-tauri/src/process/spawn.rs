@@ -4,8 +4,8 @@
 //! - 统一用 `cmd /C <start_cmd>` 执行，支持 `&&`、管道、重定向
 //! - stdout/stderr 重定向到日志文件（两独立 append 句柄，OS 负责交错）
 //! - `CREATE_NO_WINDOW` 避免弹出控制台窗口
-//! - 不用 `CREATE_SUSPENDED`（std/tokio spawn 前关闭主线程句柄，无法 ResumeThread）；
-//!   改用 spawn-then-assign，竞态由 KILL_ON_JOB_CLOSE 兜底
+//! - 进程**脱离**管理器生命周期：不设 kill_on_drop、不挂 Job Object，
+//!   关闭本软件后子进程继续运行；停止改由 stop_project 的 taskkill /F /T 完成
 
 use crate::error::{AppError, AppResult};
 use crate::models::Project;
@@ -75,14 +75,21 @@ pub fn spawn_command(project: &Project, log_path: &Path) -> AppResult<(Child, u3
     let mut cmd = Command::new("cmd");
     // raw_arg 不做转义，整串交给 cmd.exe 解析（支持 &&、管道、重定向）
     cmd.raw_arg(format!("/C {}", project.start_cmd));
-    // 运行时工作目录：workdir 优先（license 等资源在扫描根目录时），
-    // 为空兜底用 path（向后兼容旧数据）
-    let cwd = project.workdir.as_deref().unwrap_or(&project.path);
+    // 命令执行目录按项目类型区分：
+    // - Java 类（Springboot/JavaJar）：workdir 优先（License 等运行时资源在扫描根），
+    //   为空回退 path；mvn 用 -f 参数定位启动模块，故 cwd 在扫描根也能找到 main 类
+    // - 其他（Node/DockerCompose/Custom）：用 path（package.json 等在此）
+    let cwd = match project.r#type {
+        crate::models::ProjectType::Springboot | crate::models::ProjectType::JavaJar => {
+            project.workdir.as_deref().unwrap_or(&project.path)
+        }
+        _ => &project.path,
+    };
     cmd.current_dir(cwd);
     cmd.stdin(Stdio::null());
     cmd.stdout(stdout);
     cmd.stderr(stderr);
-    cmd.kill_on_drop(true); // 兜底：Child drop 时也尝试 kill
+    // 不设 kill_on_drop：进程脱离管理器生命周期，关闭软件后子进程继续运行。
 
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);

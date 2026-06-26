@@ -422,12 +422,13 @@ impl DetectService {
     ///
     /// - `is_spring_boot`：是否 SpringBoot（影响方案数量与命令）
     /// - `jar_name`：推断的 jar 文件名
-    /// - `root`：扫描根目录（= workdir）
-    /// - `mod_rel`：模块相对根目录的路径（如 "backend/hr"）；root==模块时为模块名
+    /// - `root`：扫描根目录（= workdir，License 等运行时资源在此）
+    /// - `mod_rel`：模块相对根目录的路径（如 "backend/hr"）
     ///
-    /// 运行目录策略：
-    /// - spawn current_dir = workdir（root），故 java -jar 须用 mod_rel 指向模块 target
-    /// - SpringBoot mvn 在模块目录执行，命令里用 workingDirectory 让 fork JVM 切到 root
+    /// 运行目录策略（spawn current_dir 按类型区分，见 spawn.rs）：
+    /// - Java 类：current_dir = workdir（root），mvn 用 `-f <mod_rel>/pom.xml` 定位启动模块，
+    ///   fork=false 时 user.dir=root 自动找到 License；fork=true 时 workingDirectory 参数生效
+    /// - 打包运行：current_dir = workdir（root），jar 在模块 target/ 下，用 mod_rel 指向
     fn build_maven_schemes(
         is_spring_boot: bool,
         jar_name: &Option<String>,
@@ -448,6 +449,10 @@ impl DetectService {
             None => format!("java -jar {jar_rel_prefix}app.jar"),
         };
 
+        // mvn 用 -f 定位启动模块 pom：spawn cwd=workdir(root)，模块在子目录下。
+        // mod_rel 非空（relpath 在 dir==root 时退化为目录名），故总有 <mod_rel>/pom.xml。
+        let f_param = format!("-f {mod_rel}/pom.xml ");
+
         if is_spring_boot {
             let wd_param = format!("-Dspring-boot.run.workingDirectory=\"{root}\"");
             let desc = match jar_name {
@@ -458,19 +463,22 @@ impl DetectService {
                 LaunchScheme {
                     label: "开发模式".to_string(),
                     recommended: true,
-                    start_cmd: format!("mvn spring-boot:run {wd_param}"),
+                    start_cmd: format!("mvn {f_param}spring-boot:run {wd_param}"),
                     build_cmd: None,
-                    description: "Maven fork 子进程运行，工作目录设为项目根目录；\
-                        改代码重跑即可，日常开发最快"
+                    description: "Maven fork 子进程运行，workingDirectory 设为项目根目录；\
+                        改代码重跑即可，日常开发最快。依赖多/路径长时若报 error=206 请用内嵌运行"
                         .to_string(),
                 },
                 LaunchScheme {
                     label: "开发模式（内嵌运行）".to_string(),
                     recommended: false,
-                    start_cmd: format!("mvn spring-boot:run -Dspring-boot.run.fork=false {wd_param}"),
+                    // fork=false 时 workingDirectory 参数被 Maven 忽略（仅 fork 模式生效），
+                    // 故不写它；user.dir 由 spawn cwd（=workdir root）决定，License 在 root 能找到。
+                    start_cmd: format!("mvn {f_param}spring-boot:run -Dspring-boot.run.fork=false"),
                     build_cmd: None,
                     description: "不 fork 子进程，在 Maven 同进程内运行，规避 Windows \
-                        classpath 超长（CreateProcess error=206）问题；依赖多、路径长时用此方案"
+                        classpath 超长（CreateProcess error=206）问题；运行时工作目录=扫描根，\
+                        License 等资源须放在扫描根目录"
                         .to_string(),
                 },
                 LaunchScheme {
@@ -1045,20 +1053,23 @@ public class Helper {
         let schemes =
             DetectService::build_maven_schemes(true, &Some("app.jar".to_string()), "D:/code/repo", "svc");
         assert_eq!(schemes.len(), 3);
-        // [0] 开发模式（默认）— 注入 workingDirectory 让 fork JVM 在根目录运行
+        // [0] 开发模式（默认）— -f 定位模块 + workingDirectory 让 fork JVM 在根目录运行
         assert!(schemes[0].recommended);
         assert!(schemes[0]
             .start_cmd
-            .contains("mvn spring-boot:run"));
+            .contains("mvn -f svc/pom.xml spring-boot:run"));
         assert!(schemes[0]
             .start_cmd
             .contains("-Dspring-boot.run.workingDirectory"));
         assert!(schemes[0].build_cmd.is_none());
-        // [1] 开发模式（内嵌运行）— fork=false 规避 Windows error=206
+        // [1] 开发模式（内嵌运行）— fork=false 规避 Windows error=206；不带 workingDirectory（fork=false 下无效）
         assert!(!schemes[1].recommended);
         assert!(schemes[1]
             .start_cmd
-            .contains("-Dspring-boot.run.fork=false"));
+            .contains("mvn -f svc/pom.xml spring-boot:run -Dspring-boot.run.fork=false"));
+        assert!(!schemes[1]
+            .start_cmd
+            .contains("workingDirectory"));
         assert!(schemes[1].build_cmd.is_none());
         // [2] 打包运行模式 — jar 路径含模块相对路径（svc/target/）
         assert!(schemes[2]
