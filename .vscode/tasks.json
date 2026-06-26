@@ -11,6 +11,14 @@
         "isDefault": true
       },
       "problemMatcher": []
+    },
+    {
+      "label": "Tauri Build",
+      "type": "shell",
+      "command": "pnpm",
+      "args": ["tauri", "build"],
+      "group": "build",
+      "problemMatcher": []
     }
   ]
 }

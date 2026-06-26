@@ -140,7 +140,14 @@ onBeforeUnmount(() => {
 }
 .theme-icon {
   cursor: pointer;
-  padding: 9px 12px;
+  /* 与 .win-btn 一致的盒模型，使图标与窗口三按钮等大 */
+  width: 46px;
+  height: 100%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  /* 与窗口三按钮拉开间距 */
+  margin-right: 8px;
   color: var(--titlebar-fg);
   opacity: 0.75;
   transition: opacity 0.15s;

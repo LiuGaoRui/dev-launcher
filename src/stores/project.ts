@@ -25,7 +25,7 @@ import type { HealthStatus, ProjectStatus } from '@/types/monitor'
 import { safeCall } from '@/api/invoke'
 
 /** 监控轮询间隔（ms），对齐开发计划 §5.4 的 3s 周期 */
-const POLL_INTERVAL_MS = 3000
+export const POLL_INTERVAL_MS = 3000
 
 export const useProjectStore = defineStore('project', () => {
   const projects = ref<Project[]>([])

@@ -59,6 +59,7 @@ pub fn run() {
             commands::scan_root::reorder_scan_roots,
             // system
             commands::system::open_url,
+            commands::system::get_app_memory,
             // log
             commands::log::subscribe_log,
             commands::log::read_log_history,
