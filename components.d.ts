@@ -15,6 +15,7 @@ declare module 'vue' {
     PlaceholderPage: typeof import('./src/components/PlaceholderPage.vue')['default']
     ProjectCard: typeof import('./src/components/project/ProjectCard.vue')['default']
     ProjectFormDialog: typeof import('./src/components/project/ProjectFormDialog.vue')['default']
+    ProjectScanDialog: typeof import('./src/components/project/ProjectScanDialog.vue')['default']
     RouterLink: typeof import('vue-router')['RouterLink']
     RouterView: typeof import('vue-router')['RouterView']
     StatusBadge: typeof import('./src/components/project/StatusBadge.vue')['default']

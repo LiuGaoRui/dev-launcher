@@ -127,6 +127,7 @@ mod integration_tests {
             group_id: None,
             r#type: ProjectType::Custom,
             path: ".".into(),
+            workdir: None,
             start_cmd: cmd.into(),
             build_cmd: None,
             expected_ports: vec![],

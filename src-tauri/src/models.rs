@@ -84,6 +84,8 @@ pub struct Project {
     pub group_id: Option<i64>,
     pub r#type: ProjectType,
     pub path: String,
+    /// 运行时工作目录（可选）。空 → 用 path；有值 → spawn 用此作 current_dir。
+    pub workdir: Option<String>,
     pub start_cmd: String,
     pub build_cmd: Option<String>,
     /// 端口列表（JSON 数组存 TEXT 列）
@@ -104,6 +106,9 @@ pub struct ProjectInput {
     pub group_id: Option<i64>,
     pub r#type: ProjectType,
     pub path: String,
+    /// 运行时工作目录（可选）
+    #[serde(default)]
+    pub workdir: Option<String>,
     pub start_cmd: String,
     pub build_cmd: Option<String>,
     #[serde(default)]
@@ -132,8 +137,10 @@ pub fn now_iso() -> String {
 pub struct DetectedProject {
     /// 相对根目录的展示路径，如 "backend/hr-service"
     pub rel_path: String,
-    /// 绝对路径（→ project.path）
+    /// 绝对路径（→ project.path，找 pom/package.json 的目录）
     pub path: String,
+    /// 运行时工作目录（→ project.workdir，默认=扫描根目录）
+    pub workdir: String,
     /// 推断的项目名（package.json name / pom artifactId / 目录名）
     pub name: String,
     /// 项目类型（springboot | java_jar | node）

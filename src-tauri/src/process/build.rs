@@ -196,6 +196,7 @@ mod tests {
             group_id: None,
             r#type: crate::models::ProjectType::Custom,
             path: ".".into(),
+            workdir: None,
             start_cmd: "echo".into(),
             build_cmd: None, // 未配置
             expected_ports: vec![],

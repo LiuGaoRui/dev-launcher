@@ -192,6 +192,8 @@ function buildInput(d: DetectedProject): ProjectInput | null {
     group_id: props.defaultGroupId ?? null,
     type: d.type,
     path: d.path,
+    // workdir 默认用扫描根目录（license 等运行时资源在此）
+    workdir: d.workdir || null,
     start_cmd: scheme.start_cmd,
     build_cmd: scheme.build_cmd,
     expected_ports: ports,

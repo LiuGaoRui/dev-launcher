@@ -11,6 +11,9 @@
 //! - pom / package.json / application 配置均用字符串/JSON 方式轻量解析，不引入重型 XML 库
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use regex::Regex;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{DetectedProject, LaunchScheme, ProjectType};
@@ -36,10 +39,14 @@ const SKIP_DIRS: &[&str] = &[
 /// DFS 最大深度（根目录为第 0 层）。
 const MAX_DEPTH: u32 = 4;
 
-/// `detect_maven` 的探测结果：聚合器容器（继续下钻）或真实项目。
+/// `detect_maven` 的探测结果。
 enum MavenProbe {
+    /// 聚合器（`<packaging>pom</packaging>`），作为 monorepo 容器继续下钻
     Aggregator,
+    /// 可执行项目（SpringBoot 或带可执行 jar 标志的普通 Maven），加入结果
     Project(DetectedProject),
+    /// 纯类库（jar，不可独立启动），不入结果但停止下钻
+    Library,
 }
 
 pub struct DetectService;
@@ -124,12 +131,13 @@ impl DetectService {
 
         // 判定本目录是否为「项目根」
         if has_pom {
-            // pom.xml：Maven 项目。聚合器（packaging=pom）视为 monorepo 容器，继续下钻
+            // pom.xml：Maven 项目。聚合器视为 monorepo 容器继续下钻
             match Self::detect_maven(root, dir)? {
                 Some(MavenProbe::Project(d)) => {
                     out.push(d);
                     return Ok(());
                 }
+                Some(MavenProbe::Library) => { /* 纯类库 jar，不入结果，停止下钻 */ }
                 Some(MavenProbe::Aggregator) => { /* monorepo 容器：继续下钻子目录 */ }
                 None => { /* 非 Maven 项目根，继续下钻 */ }
             }
@@ -186,8 +194,8 @@ impl DetectService {
                 .is_some()
         };
 
-        // 推断端口
-        let ports = Self::infer_node_ports(pkg);
+        // 推断端口：优先读配置文件实际端口，再按依赖兜底默认值
+        let ports = Self::detect_node_ports(dir, pkg);
 
         // 构建启动命令
         let dev_cmd = if has_script("dev") {
@@ -221,6 +229,7 @@ impl DetectService {
         Ok(Some(DetectedProject {
             rel_path: relpath(root, dir),
             path: dir.to_string_lossy().to_string(),
+            workdir: root.to_string_lossy().to_string(),
             name,
             r#type: ProjectType::Node,
             expected_ports: ports,
@@ -239,19 +248,33 @@ impl DetectService {
         }
     }
 
-    /// 根据依赖推断 Node 项目端口。
-    fn infer_node_ports(pkg: &serde_json::Value) -> Vec<String> {
-        // vite 常出现在 devDependencies，故同时查 dependencies + devDependencies
+    /// 推断 Node 项目端口：优先从配置文件读取实际端口，找不到再按依赖兜底默认值。
+    ///
+    /// 读取顺序：① vue-cli 的 `vue.config.js`（含 `|| <port>` 或 `port: <port>`）
+    ///          ② vite 的 `vite.config.[js|ts]`（`server.port`）
+    /// 都没有则按依赖给框架默认端口（vite→5173、@vue/cli-service→8080 等）。
+    fn detect_node_ports(dir: &Path, pkg: &serde_json::Value) -> Vec<String> {
         let in_deps = |section: &str, name: &str| {
             pkg.get(section).and_then(|v| v.get(name)).is_some()
         };
         let has = |n: &str| in_deps("dependencies", n) || in_deps("devDependencies", n);
 
+        // vue-cli：读 vue.config.js 实际端口
+        if has("@vue/cli-service") {
+            if let Some(p) = read_port_from_vue_config(dir) {
+                return vec![p];
+            }
+            return vec!["8080".to_string()];
+        }
+        // vite：读 vite.config 实际端口
         if has("vite") {
-            vec!["5173".to_string()]
-        } else if has("@vue/cli-service") {
-            vec!["8080".to_string()]
-        } else if has("@angular/cli") {
+            if let Some(p) = read_port_from_vite_config(dir) {
+                return vec![p];
+            }
+            return vec!["5173".to_string()];
+        }
+        // 其他框架只有默认值，无配置文件可读
+        if has("@angular/cli") {
             vec!["4200".to_string()]
         } else if has("next") || has("react-scripts") || has("nuxt") {
             vec!["3000".to_string()]
@@ -267,7 +290,8 @@ impl DetectService {
     /// 返回：
     /// - `Ok(None)` — 不是 Maven 项目根（无 pom.xml 或读取失败）
     /// - `Ok(Some(Aggregator))` — 聚合器（`<packaging>pom</packaging>`），继续下钻
-    /// - `Ok(Some(Project(d)))` — 有效项目
+    /// - `Ok(Some(Library))` — 非启动模块（无 main 或无端口），不入结果
+    /// - `Ok(Some(Project(d)))` — 启动模块（有 main 入口 + 有端口）
     fn detect_maven(root: &Path, dir: &Path) -> AppResult<Option<MavenProbe>> {
         let pom_path = dir.join("pom.xml");
         let content = match std::fs::read_to_string(&pom_path) {
@@ -282,7 +306,18 @@ impl DetectService {
             return Ok(Some(MavenProbe::Aggregator));
         }
 
-        // spring-boot 检测用原始内容：继承关系常在 <parent> 里（已被 strip 删除）
+        // ===== 启动模块双硬条件：必须有 main 入口 + 必须有端口 =====
+        // 没有 main 方法 → 类库/common 模块，不可独立启动
+        if !has_main_class(dir) {
+            return Ok(Some(MavenProbe::Library));
+        }
+        // 没有可识别端口 → 无法健康检查，不算启动模块
+        let expected_ports = Self::read_java_port(dir);
+        if expected_ports.is_empty() {
+            return Ok(Some(MavenProbe::Library));
+        }
+
+        // 通过双硬条件后，按是否含 spring-boot 细分类型（用于启动方案生成）
         let is_spring_boot = content.contains("spring-boot");
         let ptype = if is_spring_boot {
             ProjectType::Springboot
@@ -300,19 +335,16 @@ impl DetectService {
 
         // jar 名：优先扫 target/*.jar 实际产物；其次 pom 坐标；最后占位
         let jar_name = Self::resolve_jar_name(dir, &stripped);
+        // 模块相对根目录路径（用于 java -jar 时从根目录指向模块 target）
+        let mod_rel = relpath(root, dir);
+        let root_str = root.to_string_lossy().to_string();
 
-        // 端口：读 application 配置
-        let port = Self::read_java_port(dir);
-        let expected_ports = match port {
-            Some(p) => vec![p],
-            None => Vec::new(),
-        };
-
-        let schemes = Self::build_maven_schemes(is_spring_boot, &jar_name);
+        let schemes = Self::build_maven_schemes(is_spring_boot, &jar_name, &root_str, &mod_rel);
 
         Ok(Some(MavenProbe::Project(DetectedProject {
-            rel_path: relpath(root, dir),
+            rel_path: mod_rel,
             path: dir.to_string_lossy().to_string(),
+            workdir: root_str,
             name,
             r#type: ptype,
             expected_ports,
@@ -333,38 +365,91 @@ impl DetectService {
         None
     }
 
-    /// 读 Java 应用端口（application.properties / application.yml）。
-    fn read_java_port(dir: &Path) -> Option<String> {
+    /// 读 Java 应用端口：扫描所有 application 配置文件（含多 profile），
+    /// 返回发现的全部端口（去重）。
+    ///
+    /// 覆盖：`application.properties` / `application.yml` / `application.yaml`
+    /// 及 `application-{profile}.properties/.yml/.yaml`。
+    fn read_java_port(dir: &Path) -> Vec<String> {
         let res = dir.join("src/main/resources");
-        // properties
-        let props = res.join("application.properties");
-        if let Ok(content) = std::fs::read_to_string(&props) {
-            if let Some(p) = parse_properties_port(&content) {
-                return Some(p);
+        let entries = match std::fs::read_dir(&res) {
+            Ok(e) => e,
+            Err(_) => return Vec::new(),
+        };
+
+        // 先默认配置，再 profile 配置；按文件名排序保证多次扫描结果稳定
+        let mut files: Vec<PathBuf> = Vec::new();
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("application") {
+                files.push(entry.path());
             }
         }
-        // yml（尝试 application.yml / application.yaml）
-        for fname in &["application.yml", "application.yaml"] {
-            let p = res.join(fname);
-            if let Ok(content) = std::fs::read_to_string(&p) {
-                if let Some(port) = parse_yml_port(&content) {
-                    return Some(port);
+        files.sort_by(|a, b| {
+            a.file_name()
+                .unwrap_or_default()
+                .cmp(b.file_name().unwrap_or_default())
+        });
+
+        let mut ports: Vec<String> = Vec::new();
+        for path in files {
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let is_properties = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map_or(false, |e| e.eq_ignore_ascii_case("properties"));
+            let port = if is_properties {
+                parse_properties_port(&content)
+            } else {
+                parse_yml_port(&content)
+            };
+            if let Some(p) = port {
+                if !p.is_empty() && !ports.contains(&p) {
+                    ports.push(p);
                 }
             }
         }
-        None
+        ports
     }
 
     /// 生成 Maven 项目的启动方案。
-    fn build_maven_schemes(is_spring_boot: bool, jar_name: &Option<String>) -> Vec<LaunchScheme> {
-        // 共用：打包运行命令 / 构建命令（spring-boot 与 plain 仅描述与推荐位不同）
-        let jar_start = match jar_name {
-            Some(j) => format!("java -jar target/{j}"),
-            None => "java -jar target/app.jar".to_string(),
-        };
+    ///
+    /// - `is_spring_boot`：是否 SpringBoot（影响方案数量与命令）
+    /// - `jar_name`：推断的 jar 文件名
+    /// - `root`：扫描根目录（= workdir）
+    /// - `mod_rel`：模块相对根目录的路径（如 "backend/hr"）；root==模块时为模块名
+    ///
+    /// 运行目录策略：
+    /// - spawn current_dir = workdir（root），故 java -jar 须用 mod_rel 指向模块 target
+    /// - SpringBoot mvn 在模块目录执行，命令里用 workingDirectory 让 fork JVM 切到 root
+    fn build_maven_schemes(
+        is_spring_boot: bool,
+        jar_name: &Option<String>,
+        root: &str,
+        mod_rel: &str,
+    ) -> Vec<LaunchScheme> {
         let package_build = Some("mvn clean package -DskipTests".to_string());
 
+        // 打包运行时 current_dir=root，jar 在模块 target/ 下，需用相对路径从 root 指向。
+        // mod_rel 用 '/' 分隔（relpath 保证），Windows cmd 也接受 '/' 指向子目录。
+        let jar_rel_prefix = if mod_rel.is_empty() {
+            "target/".to_string()
+        } else {
+            format!("{mod_rel}/target/")
+        };
+        let jar_start = match jar_name {
+            Some(j) => format!("java -jar {jar_rel_prefix}{j}"),
+            None => format!("java -jar {jar_rel_prefix}app.jar"),
+        };
+
         if is_spring_boot {
+            let wd_param = format!("-Dspring-boot.run.workingDirectory=\"{root}\"");
             let desc = match jar_name {
                 Some(_) => "先构建 jar 再运行，模拟生产形态",
                 None => "先构建 jar 再运行；jar 名未能自动识别，请按实际产物修正",
@@ -373,9 +458,20 @@ impl DetectService {
                 LaunchScheme {
                     label: "开发模式".to_string(),
                     recommended: true,
-                    start_cmd: "mvn spring-boot:run".to_string(),
+                    start_cmd: format!("mvn spring-boot:run {wd_param}"),
                     build_cmd: None,
-                    description: "Maven 直接运行，改代码重跑即可，日常开发最快".to_string(),
+                    description: "Maven fork 子进程运行，工作目录设为项目根目录；\
+                        改代码重跑即可，日常开发最快"
+                        .to_string(),
+                },
+                LaunchScheme {
+                    label: "开发模式（内嵌运行）".to_string(),
+                    recommended: false,
+                    start_cmd: format!("mvn spring-boot:run -Dspring-boot.run.fork=false {wd_param}"),
+                    build_cmd: None,
+                    description: "不 fork 子进程，在 Maven 同进程内运行，规避 Windows \
+                        classpath 超长（CreateProcess error=206）问题；依赖多、路径长时用此方案"
+                        .to_string(),
                 },
                 LaunchScheme {
                     label: "打包运行模式".to_string(),
@@ -404,10 +500,75 @@ impl DetectService {
 
 // ===== 辅助函数 =====
 
+/// 声明一个懒初始化的 Regex 静态变量 + 访问器函数。
+/// 用法：`lazy_regex!(my_re, r"pattern");` → 生成 `fn my_re() -> &'static Regex`。
+macro_rules! lazy_regex {
+    ($name:ident, $pat:literal) => {
+        fn $name() -> &'static Regex {
+            static RE: OnceLock<Regex> = OnceLock::new();
+            RE.get_or_init(|| Regex::new($pat).expect(concat!(stringify!($name), " 正则编译失败")))
+        }
+    };
+}
+
+lazy_regex!(fallback_port_re, r"\|\|\s*(\d{2,5})\b");
+lazy_regex!(port_key_value_re, r"(?m)\bport\s*:\s*(\d{2,5})\b");
+lazy_regex!(main_re, r"public\s+static\s+void\s+main\s*\(\s*String\s*\[\s*\]\s*\w+\s*\)");
+lazy_regex!(java_comment_re, r"//[^\n]*|/\*[\s\S]*?\*/");
+
 /// 读取并解析 package.json；读失败或非法 JSON 返回 None。
 fn read_pkg_json(path: &Path) -> Option<serde_json::Value> {
     let content = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
+}
+
+/// 从 vue.config.js 提取 devServer 端口。
+///
+/// 覆盖常见写法：
+/// - `const port = process.env.port || 8188`（取 `||` 后的数字）
+/// - `devServer: { port: 8188 }` 或 `port: 8080,`
+/// - `const PORT = process.env.port || process.env.npm_config_port || 9100`
+fn read_port_from_vue_config(dir: &Path) -> Option<String> {
+    let path = dir.join("vue.config.js");
+    let content = std::fs::read_to_string(&path).ok()?;
+    extract_port_from_config(&content)
+}
+
+/// 从 JS/TS 配置文件文本中提取端口。优先 `|| <port>` 兜底写法，次选 `port: <数字>` 键值。
+fn extract_port_from_config(content: &str) -> Option<String> {
+    extract_fallback_port_after_or(content).or_else(|| extract_port_key_value(content))
+}
+
+/// 从 vite.config.[js|ts|mjs] 提取 server.port。
+fn read_port_from_vite_config(dir: &Path) -> Option<String> {
+    for fname in &["vite.config.js", "vite.config.ts", "vite.config.mjs"] {
+        if let Ok(content) = std::fs::read_to_string(dir.join(fname)) {
+            if let Some(port) = extract_port_from_config(&content) {
+                return Some(port);
+            }
+        }
+    }
+    None
+}
+
+/// 提取 `|| <port>` 兜底写法中的端口（取最后一个 `||` 后的数字）。
+///
+/// 例：`process.env.port || process.env.npm_config_port || 8188` → 8188
+fn extract_fallback_port_after_or(content: &str) -> Option<String> {
+    // 取最后一个匹配（多级 || 链的最终兜底值）
+    fallback_port_re()
+        .captures_iter(content)
+        .last()
+        .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
+}
+
+/// 提取 `port: <数字>` 键值写法中的端口。
+///
+/// 例：`port: 8188` / `port: 8080,` / `port: 5174 }`
+fn extract_port_key_value(content: &str) -> Option<String> {
+    port_key_value_re()
+        .captures(content)
+        .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
 }
 
 /// 计算 dir 相对 root 的展示路径。
@@ -452,7 +613,60 @@ fn is_pom_aggregator(stripped: &str) -> bool {
     false
 }
 
-/// 从已预处理（去注释 + 去 parent）的 pom 中取首个 <artifactId>。
+/// 判断 Maven 项目是否真的含 main 入口方法。
+///
+/// 扫描 `src/main/java/` 下所有 `.java` 文件，查找标准 main 签名：
+/// `public static void main(String[] args)`。这是比 pom 打包插件更可靠的
+/// 「可启动模块」判定——类库/common 模块没有 main 方法，自然被过滤。
+///
+/// 匹配策略（对换行/空格/参数名宽松，避免漏判正常代码）：
+/// - 先用正则去掉单行/多行注释，避免误命中注释里的 main
+/// - 再匹配 `public static void main ( String [] <name> )`（void/static 顺序、
+///   参数名、空格弹性）
+fn has_main_class(dir: &Path) -> bool {
+    let java_root = dir.join("src/main/java");
+    let mut stack = vec![java_root.clone()];
+    while let Some(cur) = stack.pop() {
+        let entries = match std::fs::read_dir(&cur) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if ft.is_dir() {
+                stack.push(path);
+            } else if ft.is_file() && path.extension().and_then(|e| e.to_str()) == Some("java") {
+                if let Ok(src) = std::fs::read_to_string(&path) {
+                    if file_has_main(&src) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// 检测单个 Java 源文件内容是否含 main 方法。
+fn file_has_main(src: &str) -> bool {
+    // 快速路径：先对原始内容匹配（注释里恰好含 main 签名的情况极少），
+    // 命中再脱注释二次确认，避免每个非 main 文件都做全文字符串分配。
+    if !main_re().is_match(src) {
+        return false;
+    }
+    let cleaned = strip_java_comments(src);
+    main_re().is_match(&cleaned)
+}
+
+/// 剥离 Java 注释（单行 `//` 和多行 `/* */`），避免误命中注释内的 main。
+fn strip_java_comments(src: &str) -> String {
+    java_comment_re().replace_all(src, "").to_string()
+}
+
 fn extract_pom_artifact_id(stripped: &str) -> Option<String> {
     extract_first_tag(stripped, "artifactId")
 }
@@ -564,34 +778,39 @@ fn parse_properties_port(content: &str) -> Option<String> {
     None
 }
 
-/// 解析 yml 中 server.port（简易缩进匹配，不引入 yaml 库）。
+/// 解析 yml/yaml 中 server.port（简易缩进匹配，不引入 yaml 库）。
+///
+/// 逻辑：找到顶层 `server:` 块（缩进为 0），在该块的子层级里找 `port:` 键。
+/// 健壮性：用「下一行缩进 ≤ server 缩进即视为块结束」来判断块边界，能正确处理
+/// server 块出现在文档任意位置、其后还有其他顶层块的情况。
 fn parse_yml_port(content: &str) -> Option<String> {
-    let mut in_server = false;
-    let mut server_indent: usize = 0;
-    for line in content.lines() {
-        // 跳过注释
+    let mut lines = content.lines().peekable();
+    while let Some(line) = lines.next() {
         let trimmed = line.trim();
         if trimmed.starts_with('#') || trimmed.is_empty() {
             continue;
         }
         let indent = line.len() - line.trim_start().len();
-        // 顶层 server: 块开始
         if indent == 0 && trimmed == "server:" {
-            in_server = true;
-            server_indent = 0;
-            continue;
-        }
-        if in_server {
-            // 更顶层的新块结束 server 段
-            if indent <= server_indent && trimmed.ends_with(':') {
-                in_server = false;
-                continue;
-            }
-            if let Some((k, v)) = trimmed.split_once(':') {
-                if k.trim() == "port" {
-                    let v = v.trim().trim_matches('"');
-                    if !v.is_empty() {
-                        return Some(v.to_string());
+            // 在 server 块内查找 port
+            while let Some(&l) = lines.peek() {
+                let lt = l.trim();
+                if lt.starts_with('#') || lt.is_empty() {
+                    lines.next();
+                    continue;
+                }
+                let l_indent = l.len() - l.trim_start().len();
+                // 缩进回到 server 同级或更上层 → server 块结束
+                if l_indent <= indent {
+                    break;
+                }
+                lines.next();
+                if let Some((k, v)) = lt.split_once(':') {
+                    if k.trim() == "port" {
+                        let v = v.trim().trim_matches('"').trim_matches('\'');
+                        if !v.is_empty() {
+                            return Some(v.to_string());
+                        }
                     }
                 }
             }
@@ -684,6 +903,77 @@ mod tests {
     }
 
     #[test]
+    fn vue_config_port_from_env_fallback() {
+        // `const port = process.env.port || 8188`
+        let content = "const port = process.env.port || 8188\nmodule.exports = { devServer: { port } };\n";
+        assert_eq!(extract_port_from_config(content).as_deref(), Some("8188"));
+    }
+
+    #[test]
+    fn vue_config_port_from_chained_or() {
+        // 多级 || 链，取最后一个
+        let content =
+            "const PORT = process.env.port || process.env.npm_config_port || 9100;\n";
+        assert_eq!(extract_fallback_port_after_or(content).as_deref(), Some("9100"));
+    }
+
+    #[test]
+    fn vue_config_port_from_key_value() {
+        // devServer: { port: 8888 }
+        let content = "module.exports = {\n  devServer: {\n    port: 8888,\n    open: true\n  }\n};\n";
+        assert_eq!(extract_port_key_value(content).as_deref(), Some("8888"));
+    }
+
+    #[test]
+    fn vue_config_no_port_returns_none() {
+        let content = "module.exports = { publicPath: '/' };\n";
+        assert!(extract_port_from_config(content).is_none());
+    }
+
+    #[test]
+    fn vite_config_port_from_server_block() {
+        // server: { port: 5174 }
+        let content = "export default defineConfig({\n  server: {\n    port: 5174,\n    host: true\n  }\n});\n";
+        assert_eq!(extract_port_key_value(content).as_deref(), Some("5174"));
+    }
+
+    #[tokio::test]
+    async fn scan_node_vue_cli_reads_config_port() {
+        // vue-cli 项目：vue.config.js 里 port=8188，应提取 8188 而非默认 8080
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            &root.join("web/package.json"),
+            r#"{"name":"web","scripts":{"dev":"vue-cli-service serve"},"devDependencies":{"@vue/cli-service":"^5.0.0"}}"#,
+        );
+        write(
+            &root.join("web/vue.config.js"),
+            "const port = process.env.port || 8188\nmodule.exports = { devServer: { port } };\n",
+        );
+        let detected = DetectService::scan(&root.to_string_lossy()).await.unwrap();
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0].expected_ports, vec!["8188".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn scan_node_vite_reads_config_port() {
+        // vite 项目：vite.config.js 里 port=5174，应提取 5174 而非默认 5173
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            &root.join("app/package.json"),
+            r#"{"name":"app","scripts":{"dev":"vite"},"devDependencies":{"vite":"^5.0.0"}}"#,
+        );
+        write(
+            &root.join("app/vite.config.js"),
+            "import { defineConfig } from 'vite'\nexport default defineConfig({ server: { port: 5174 } })\n",
+        );
+        let detected = DetectService::scan(&root.to_string_lossy()).await.unwrap();
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0].expected_ports, vec!["5174".to_string()]);
+    }
+
+    #[test]
     fn properties_port_parsed() {
         let content = "server.port=9090\nspring.application.name=demo\n";
         assert_eq!(parse_properties_port(content).as_deref(), Some("9090"));
@@ -702,24 +992,91 @@ mod tests {
     }
 
     #[test]
-    fn spring_boot_pom_produces_two_schemes() {
-        let schemes = DetectService::build_maven_schemes(true, &Some("app.jar".to_string()));
-        assert_eq!(schemes.len(), 2);
+    fn yml_port_parsed_when_server_in_middle() {
+        // server 块出现在文档中间，其后还有其他顶层块
+        let content = "spring:\n  application:\n    name: demo\nserver:\n  port: 9000\nlogging:\n  level: info\n";
+        assert_eq!(parse_yml_port(content).as_deref(), Some("9000"));
+    }
+
+    #[test]
+    fn yml_port_returns_none_when_no_server() {
+        let content = "spring:\n  application:\n    name: demo\n";
+        assert!(parse_yml_port(content).is_none());
+    }
+
+    #[test]
+    fn main_method_detected_in_source() {
+        let src = r#"package com.example;
+public class App {
+    public static void main(String[] args) {
+        System.out.println("hello");
+    }
+}"#;
+        assert!(file_has_main(src));
+    }
+
+    #[test]
+    fn main_method_with_flexible_spacing() {
+        // 换行/多空格/不同参数名
+        let src = "public static   void\n  main (  String  [ ]  myArgs ) { }";
+        assert!(file_has_main(src));
+    }
+
+    #[test]
+    fn main_method_in_comment_ignored() {
+        // 注释里的假 main 不应命中
+        let src = r#"// public static void main(String[] args)
+/* public static void main(String[] args) */
+public class Util {}"#;
+        assert!(!file_has_main(src));
+    }
+
+    #[test]
+    fn library_without_main_not_matched() {
+        let src = r#"package com.example;
+public class Helper {
+    public String greet() { return "hi"; }
+}"#;
+        assert!(!file_has_main(src));
+    }
+
+    #[test]
+    fn spring_boot_pom_produces_three_schemes() {
+        let schemes =
+            DetectService::build_maven_schemes(true, &Some("app.jar".to_string()), "D:/code/repo", "svc");
+        assert_eq!(schemes.len(), 3);
+        // [0] 开发模式（默认）— 注入 workingDirectory 让 fork JVM 在根目录运行
         assert!(schemes[0].recommended);
-        assert_eq!(schemes[0].start_cmd, "mvn spring-boot:run");
-        assert_eq!(schemes[1].start_cmd, "java -jar target/app.jar");
+        assert!(schemes[0]
+            .start_cmd
+            .contains("mvn spring-boot:run"));
+        assert!(schemes[0]
+            .start_cmd
+            .contains("-Dspring-boot.run.workingDirectory"));
+        assert!(schemes[0].build_cmd.is_none());
+        // [1] 开发模式（内嵌运行）— fork=false 规避 Windows error=206
+        assert!(!schemes[1].recommended);
+        assert!(schemes[1]
+            .start_cmd
+            .contains("-Dspring-boot.run.fork=false"));
+        assert!(schemes[1].build_cmd.is_none());
+        // [2] 打包运行模式 — jar 路径含模块相对路径（svc/target/）
+        assert!(schemes[2]
+            .start_cmd
+            .contains("java -jar svc/target/app.jar"));
         assert_eq!(
-            schemes[1].build_cmd.as_deref(),
+            schemes[2].build_cmd.as_deref(),
             Some("mvn clean package -DskipTests")
         );
     }
 
     #[test]
     fn plain_jar_pom_produces_one_scheme() {
-        let schemes = DetectService::build_maven_schemes(false, &None);
+        let schemes = DetectService::build_maven_schemes(false, &None, "D:/code/repo", "cli");
         assert_eq!(schemes.len(), 1);
         assert!(schemes[0].recommended);
-        assert!(schemes[0].start_cmd.starts_with("java -jar target/"));
+        // jar 路径含模块相对路径
+        assert!(schemes[0].start_cmd.contains("java -jar cli/target/"));
         assert!(schemes[0].build_cmd.is_some());
     }
 
@@ -754,6 +1111,17 @@ mod tests {
             &root.join("backend/hr/src/main/resources/application.properties"),
             "server.port=8088\n",
         );
+        // main 入口（启动模块硬条件）
+        write(
+            &root.join("backend/hr/src/main/java/com/example/HrApplication.java"),
+            r#"package com.example;
+import org.springframework.boot.SpringApplication;
+public class HrApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(HrApplication.class, args);
+    }
+}"#,
+        );
 
         let detected = DetectService::scan(&root.to_string_lossy()).await.unwrap();
         // 2 个项目
@@ -764,7 +1132,7 @@ mod tests {
         assert_eq!(back.r#type, ProjectType::Springboot);
         assert_eq!(back.name, "hr");
         assert_eq!(back.expected_ports, vec!["8088".to_string()]);
-        assert_eq!(back.schemes.len(), 2);
+        assert_eq!(back.schemes.len(), 3);
         assert_eq!(front.r#type, ProjectType::Node);
         assert_eq!(front.name, "web");
         assert_eq!(front.expected_ports, vec!["5173".to_string()]);
@@ -846,6 +1214,12 @@ mod tests {
     <version>3.2.0</version></parent>
 </project>"#,
         );
+        // 子模块的 main + 端口
+        write_springboot_main(&root.join("svc"), "com/example", "SvcApplication");
+        write(
+            &root.join("svc/src/main/resources/application.properties"),
+            "server.port=8080\n",
+        );
 
         let detected = DetectService::scan(&root.to_string_lossy()).await.unwrap();
         assert_eq!(detected.len(), 1);
@@ -870,6 +1244,25 @@ mod tests {
         assert!(matches!(err, AppError::Io(_)));
     }
 
+    /// 辅助：写入一个标准 SpringBoot 启动类（含 main）
+    fn write_springboot_main(root: &Path, rel_pkg: &str, class: &str) {
+        let path = root.join(format!("src/main/java/{rel_pkg}/{class}.java"));
+        write(
+            &path,
+            &format!(
+                r#"package {pkg};
+import org.springframework.boot.SpringApplication;
+public class {cls} {{
+    public static void main(String[] args) {{
+        SpringApplication.run({cls}.class, args);
+    }}
+}}"#,
+                pkg = rel_pkg.replace('/', "."),
+                cls = class
+            ),
+        );
+    }
+
     #[tokio::test]
     async fn scan_jar_name_from_target_overrides_coord() {
         let tmp = tempdir().unwrap();
@@ -881,6 +1274,12 @@ mod tests {
   <version>1.0</version>
 </project>"#,
         );
+        // main 入口 + 端口（启动模块双硬条件）
+        write_springboot_main(&root.join("svc"), "com/example", "SvcApplication");
+        write(
+            &root.join("svc/src/main/resources/application.properties"),
+            "server.port=9000\n",
+        );
         // target 里已有构建产物
         fs::create_dir_all(root.join("svc/target")).unwrap();
         fs::write(root.join("svc/target/svc-1.0.jar"), b"").unwrap();
@@ -891,5 +1290,141 @@ mod tests {
         assert!(detected[0].schemes[0]
             .start_cmd
             .contains("target/svc-1.0.jar"));
+    }
+
+    #[tokio::test]
+    async fn scan_filters_library_without_main() {
+        // 无 main 方法 → 类库，过滤
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            &root.join("common/pom.xml"),
+            r#"<project>
+  <artifactId>common-utils</artifactId>
+  <version>1.0</version>
+</project>"#,
+        );
+        // 有端口但无 main
+        write(
+            &root.join("common/src/main/resources/application.properties"),
+            "server.port=8080\n",
+        );
+        write(
+            &root.join("common/src/main/java/com/example/Util.java"),
+            r#"package com.example;
+public class Util {
+    public String hello() { return "hi"; }
+}"#,
+        );
+        let detected = DetectService::scan(&root.to_string_lossy()).await.unwrap();
+        assert!(detected.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scan_filters_project_without_port() {
+        // 有 main 但无端口配置 → 无法健康检查，过滤
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            &root.join("svc/pom.xml"),
+            r#"<project>
+  <parent><groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.2.0</version></parent>
+  <artifactId>svc</artifactId>
+</project>"#,
+        );
+        write_springboot_main(root, "com/example", "SvcApplication");
+        // 故意不写 application 配置 → 无端口
+        let detected = DetectService::scan(&root.to_string_lossy()).await.unwrap();
+        assert!(detected.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scan_keeps_executable_jar_project() {
+        // 有 main + 有端口 → 普通可执行 jar 项目入结果
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            &root.join("cli/pom.xml"),
+            r#"<project>
+  <artifactId>mycli</artifactId>
+  <version>2.0</version>
+</project>"#,
+        );
+        write(
+            &root.join("cli/src/main/java/com/app/Main.java"),
+            r#"package com.app;
+public class Main {
+    public static void main(String[] args) {
+        Server.start(7000);
+    }
+}"#,
+        );
+        write(
+            &root.join("cli/src/main/resources/application.properties"),
+            "server.port=7000\n",
+        );
+        let detected = DetectService::scan(&root.to_string_lossy()).await.unwrap();
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0].r#type, ProjectType::JavaJar);
+        assert_eq!(detected[0].expected_ports, vec!["7000".to_string()]);
+        assert!(detected[0].schemes[0]
+            .start_cmd
+            .contains("java -jar cli/target/"));
+    }
+
+    #[tokio::test]
+    async fn scan_springboot_with_port_detected() {
+        // SpringBoot：有 main + 显式端口 → 入结果
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            &root.join("svc/pom.xml"),
+            r#"<project>
+  <parent><groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.2.0</version></parent>
+  <artifactId>svc</artifactId>
+</project>"#,
+        );
+        write_springboot_main(&root.join("svc"), "com/example", "SvcApplication");
+        write(
+            &root.join("svc/src/main/resources/application.properties"),
+            "server.port=8088\n",
+        );
+        let detected = DetectService::scan(&root.to_string_lossy()).await.unwrap();
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0].expected_ports, vec!["8088".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn scan_reads_multi_profile_ports() {
+        // application.yml + application-dev.yml 含不同端口，都应被提取
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            &root.join("svc/pom.xml"),
+            r#"<project>
+  <parent><groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.2.0</version></parent>
+  <artifactId>svc</artifactId>
+</project>"#,
+        );
+        write_springboot_main(&root.join("svc"), "com/example", "SvcApplication");
+        write(
+            &root.join("svc/src/main/resources/application.yml"),
+            "server:\n  port: 8080\n",
+        );
+        write(
+            &root.join("svc/src/main/resources/application-dev.yml"),
+            "server:\n  port: 18080\n",
+        );
+        let detected = DetectService::scan(&root.to_string_lossy()).await.unwrap();
+        assert_eq!(detected.len(), 1);
+        // 两个 profile 的端口都应出现
+        assert!(detected[0].expected_ports.contains(&"8080".to_string()));
+        assert!(detected[0].expected_ports.contains(&"18080".to_string()));
     }
 }

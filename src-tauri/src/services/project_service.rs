@@ -21,7 +21,7 @@ impl ProjectService {
         group_id: Option<i64>,
     ) -> AppResult<Vec<Project>> {
         let projects = sqlx::query_as::<_, Project>(
-            "SELECT id, name, group_id, type, path, start_cmd, build_cmd,
+            "SELECT id, name, group_id, type, path, workdir, start_cmd, build_cmd,
                     expected_ports, enabled, last_pid, last_start_time, last_stop_time,
                     create_time, update_time
              FROM project
@@ -37,7 +37,7 @@ impl ProjectService {
     /// 按 id 取项目
     pub async fn get(pool: &sqlx::Pool<Sqlite>, id: i64) -> AppResult<Project> {
         let project = sqlx::query_as::<_, Project>(
-            "SELECT id, name, group_id, type, path, start_cmd, build_cmd,
+            "SELECT id, name, group_id, type, path, workdir, start_cmd, build_cmd,
                     expected_ports, enabled, last_pid, last_start_time, last_stop_time,
                     create_time, update_time
              FROM project WHERE id = ?",
@@ -63,14 +63,15 @@ impl ProjectService {
 
         let result = sqlx::query(
             r#"INSERT INTO project
-               (name, group_id, type, path, start_cmd, build_cmd,
+               (name, group_id, type, path, workdir, start_cmd, build_cmd,
                 expected_ports, enabled)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&input.name)
         .bind(input.group_id)
         .bind(input.r#type.as_str())
         .bind(&input.path)
+        .bind(input.workdir.as_ref())
         .bind(&input.start_cmd)
         .bind(input.build_cmd.as_ref())
         .bind(ports_json)
@@ -100,8 +101,8 @@ impl ProjectService {
 
         sqlx::query(
             r#"UPDATE project SET
-                 name = ?, group_id = ?, type = ?, path = ?, start_cmd = ?,
-                 build_cmd = ?, expected_ports = ?, enabled = ?,
+                 name = ?, group_id = ?, type = ?, path = ?, workdir = ?,
+                 start_cmd = ?, build_cmd = ?, expected_ports = ?, enabled = ?,
                  update_time = datetime('now')
                WHERE id = ?"#,
         )
@@ -109,6 +110,7 @@ impl ProjectService {
         .bind(input.group_id)
         .bind(input.r#type.as_str())
         .bind(&input.path)
+        .bind(input.workdir.as_ref())
         .bind(&input.start_cmd)
         .bind(input.build_cmd.as_ref())
         .bind(ports_json)
@@ -142,6 +144,7 @@ fn sample_input(name: &str) -> ProjectInput {
         group_id: None,
         r#type: ProjectType::Node,
         path: "/tmp/proj".into(),
+        workdir: None,
         start_cmd: "npm run dev".into(),
         build_cmd: Some("npm run build".into()),
         expected_ports: vec!["5173".into(), "3000".into()],

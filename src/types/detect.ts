@@ -21,8 +21,10 @@ export interface LaunchScheme {
 export interface DetectedProject {
   /** 相对根目录的展示路径，如 "backend/hr-service" */
   rel_path: string
-  /** 绝对路径（→ project.path） */
+  /** 绝对路径（→ project.path，找 pom/package.json 的目录） */
   path: string
+  /** 运行时工作目录（→ project.workdir，默认=扫描根目录） */
+  workdir: string
   /** 推断的项目名 */
   name: string
   /** 项目类型（springboot | java_jar | node） */

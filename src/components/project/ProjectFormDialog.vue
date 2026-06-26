@@ -58,6 +58,8 @@ interface FormState {
   group_id: number | null
   type: ProjectType
   path: string
+  /** 运行时工作目录（空=用 path） */
+  workdir: string
   start_cmd: string
   build_cmd: string
   expected_ports: string // 输入用逗号分隔，提交时拆数组
@@ -69,6 +71,7 @@ const EMPTY_FORM: FormState = {
   group_id: null,
   type: 'custom',
   path: '',
+  workdir: '',
   start_cmd: '',
   build_cmd: '',
   expected_ports: '',
@@ -99,6 +102,7 @@ watch(
       form.group_id = props.project.group_id
       form.type = props.project.type
       form.path = props.project.path
+      form.workdir = props.project.workdir ?? ''
       form.start_cmd = props.project.start_cmd
       form.build_cmd = props.project.build_cmd ?? ''
       form.expected_ports = props.project.expected_ports.join(', ')
@@ -142,6 +146,22 @@ async function pickDirectory() {
   }
 }
 
+async function pickWorkdir() {
+  try {
+    const selected = await openDialog({
+      directory: true,
+      multiple: false,
+      title: '选择运行时工作目录',
+      defaultPath: form.workdir || form.path || undefined,
+    })
+    if (typeof selected === 'string' && selected.length > 0) {
+      form.workdir = selected
+    }
+  } catch (e) {
+    console.debug('pick workdir canceled or failed:', e)
+  }
+}
+
 // ===== 提交 =====
 
 /** 把 FormState 转成 Rust 端 ProjectInput（snake_case） */
@@ -152,6 +172,7 @@ function buildInput(): ProjectInput {
     group_id: form.group_id,
     type: form.type,
     path: form.path.trim(),
+    workdir: form.workdir.trim() || null,
     start_cmd: form.start_cmd.trim(),
     build_cmd: form.build_cmd.trim() || null,
     expected_ports: ports,
@@ -214,6 +235,18 @@ function handleClose() {
             style="flex: 1"
           />
           <NButton @click="pickDirectory">选择...</NButton>
+        </NInputGroup>
+      </NFormItem>
+
+      <NFormItem label="工作目录" path="workdir">
+        <NInputGroup>
+          <NInput
+            v-model:value="form.workdir"
+            placeholder="留空则同项目目录；license 等资源在上级目录时填此项"
+            readonly
+            style="flex: 1"
+          />
+          <NButton @click="pickWorkdir">选择...</NButton>
         </NInputGroup>
       </NFormItem>
 

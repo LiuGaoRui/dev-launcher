@@ -65,7 +65,8 @@ fn open_log_stdio(log_path: &Path) -> AppResult<(Stdio, Stdio)> {
 
 /// spawn 一个项目进程。
 ///
-/// - 用 `cmd /C <start_cmd>` 在 `project.path` 下执行
+/// - 用 `cmd /C <start_cmd>` 执行
+/// - current_dir 优先用 `project.workdir`（运行时工作目录），为空则用 `project.path`
 /// - stdout/stderr 重定向到 `log_path`
 /// - 返回 (Child, pid)；pid 来自 `child.id()`
 pub fn spawn_command(project: &Project, log_path: &Path) -> AppResult<(Child, u32)> {
@@ -74,7 +75,10 @@ pub fn spawn_command(project: &Project, log_path: &Path) -> AppResult<(Child, u3
     let mut cmd = Command::new("cmd");
     // raw_arg 不做转义，整串交给 cmd.exe 解析（支持 &&、管道、重定向）
     cmd.raw_arg(format!("/C {}", project.start_cmd));
-    cmd.current_dir(&project.path);
+    // 运行时工作目录：workdir 优先（license 等资源在扫描根目录时），
+    // 为空兜底用 path（向后兼容旧数据）
+    let cwd = project.workdir.as_deref().unwrap_or(&project.path);
+    cmd.current_dir(cwd);
     cmd.stdin(Stdio::null());
     cmd.stdout(stdout);
     cmd.stderr(stderr);

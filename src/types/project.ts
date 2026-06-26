@@ -40,6 +40,8 @@ export interface Project {
   /** Rust 字段为 `r#type`，serde 序列化为 `type` */
   type: ProjectType
   path: string
+  /** 运行时工作目录（null 时用 path） */
+  workdir: string | null
   start_cmd: string
   build_cmd: string | null
   /** 端口字符串数组（DB 存为 JSON TEXT） */
@@ -58,6 +60,8 @@ export interface ProjectInput {
   group_id: number | null
   type: ProjectType
   path: string
+  /** 运行时工作目录（可选，null 时用 path） */
+  workdir: string | null
   start_cmd: string
   build_cmd: string | null
   expected_ports: string[]
