@@ -34,8 +34,6 @@ import { useProjectStore } from '@/stores/project'
 
 const props = defineProps<{
   modelValue: boolean
-  /** 当前分组 tab（添加时作为新项目的 group_id） */
-  defaultGroupId?: number | null
 }>()
 
 const emit = defineEmits<{
@@ -184,11 +182,12 @@ function buildInput(d: DetectedProject): ProjectInput | null {
   const ports = parsePorts(st.ports)
   return {
     name: d.name,
-    group_id: props.defaultGroupId ?? null,
     type: d.type,
     path: d.path,
     // workdir 默认用扫描根目录（license 等运行时资源在此）
     workdir: d.workdir || null,
+    // scan_root 记录扫描根目录，前端按此分面板展示
+    scan_root: rootPath.value.trim() || null,
     start_cmd: scheme.start_cmd,
     build_cmd: scheme.build_cmd,
     expected_ports: ports,

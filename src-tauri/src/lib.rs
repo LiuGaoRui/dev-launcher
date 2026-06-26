@@ -39,17 +39,13 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            // group
-            commands::group::list_groups,
-            commands::group::create_group,
-            commands::group::update_group,
-            commands::group::delete_group,
             // project
             commands::project::list_projects,
             commands::project::get_project,
             commands::project::create_project,
             commands::project::update_project,
             commands::project::delete_project,
+            commands::project::reorder_projects,
             // detect
             commands::detect::scan_projects,
             // process
@@ -58,6 +54,11 @@ pub fn run() {
             commands::process::restart_project,
             commands::process::build_project,
             commands::process::probe_statuses,
+            // scan_root
+            commands::scan_root::list_scan_root_order,
+            commands::scan_root::reorder_scan_roots,
+            // system
+            commands::system::open_url,
             // log
             commands::log::subscribe_log,
             commands::log::read_log_history,

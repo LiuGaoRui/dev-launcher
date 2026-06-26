@@ -193,10 +193,10 @@ mod tests {
         let mut p = Project {
             id: 1,
             name: "demo".into(),
-            group_id: None,
             r#type: crate::models::ProjectType::Custom,
             path: ".".into(),
             workdir: None,
+            scan_root: None,
             start_cmd: "echo".into(),
             build_cmd: None, // 未配置
             expected_ports: vec![],
@@ -206,6 +206,7 @@ mod tests {
             last_stop_time: None,
             create_time: "".into(),
             update_time: "".into(),
+            sort_order: 0,
         };
         assert!(p.build_cmd.is_none());
         p.build_cmd = Some("   ".into());

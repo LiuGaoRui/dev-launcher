@@ -4,7 +4,8 @@
 //! 命令签名对齐 docs/03-命令清单.md。
 
 pub mod detect;
-pub mod group;
 pub mod log;
 pub mod process;
 pub mod project;
+pub mod scan_root;
+pub mod system;

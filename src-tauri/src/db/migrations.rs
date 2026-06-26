@@ -21,5 +21,17 @@ pub fn migrations() -> Vec<Migration> {
             sql: include_str!("../../migrations/0002_add_workdir.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 3,
+            description: "add scan_root column",
+            sql: include_str!("../../migrations/0003_add_scan_root.sql"),
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 4,
+            description: "add sort_order for projects and scan roots",
+            sql: include_str!("../../migrations/0004_add_sort_order.sql"),
+            kind: MigrationKind::Up,
+        },
     ]
 }

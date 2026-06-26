@@ -3,16 +3,15 @@
 //
 //   ┌──────────────────────────────────────────────┐
 //   │              TitleBar (36px)                 │
-//   ├──────────┬───────────────────────────────────┤
-//   │ Sidebar  │                                   │
-//   │ (200px)  │          <slot/> 主内容区          │
-//   │          │                                   │
-//   ├──────────┴───────────────────────────────────┤
+//   ├──────────────────────────────────────────────┤
+//   │                                              │
+//   │          <slot/> 主内容区（全宽）             │
+//   │                                              │
+//   ├──────────────────────────────────────────────┤
 //   │              StatusBar (24px)                │
 //   └──────────────────────────────────────────────┘
 
 import TitleBar from './TitleBar.vue'
-import AppSidebar from './AppSidebar.vue'
 import StatusBar from './StatusBar.vue'
 </script>
 
@@ -20,7 +19,6 @@ import StatusBar from './StatusBar.vue'
   <div class="app-shell">
     <TitleBar />
     <div class="app-body">
-      <AppSidebar />
       <main class="app-main">
         <slot />
       </main>

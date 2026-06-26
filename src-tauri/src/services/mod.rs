@@ -3,12 +3,12 @@
 //! 纯业务逻辑，不依赖 Tauri，接收 `&Pool<Sqlite>`。便于单测。
 
 pub mod detect_service;
-pub mod group_service;
 pub mod project_service;
+pub mod scan_root_service;
 
 pub use detect_service::DetectService;
-pub use group_service::GroupService;
 pub use project_service::ProjectService;
+pub use scan_root_service::ScanRootService;
 
 /// 测试共享：创建 in-memory SQLite pool 并执行迁移。
 ///

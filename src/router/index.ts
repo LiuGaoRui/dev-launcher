@@ -18,12 +18,6 @@ const routes: RouteRecordRaw[] = [
     component: () => import('@/views/ProjectDetail.vue'),
     meta: { title: '项目详情' },
   },
-  {
-    path: '/groups',
-    name: 'GroupManage',
-    component: () => import('@/views/GroupManage.vue'),
-    meta: { title: '分组管理' },
-  },
 ]
 
 const router = createRouter({

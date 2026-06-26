@@ -40,7 +40,7 @@ pub fn pool<R: Runtime>(app: &AppHandle<R>) -> AppResult<sqlx::Pool<Sqlite>> {
 
 /// 把 SQLite UNIQUE 约束错误转为业务错误。
 ///
-/// `on_unique` 在匹配到时调用，可返回具体业务错误（如 `GroupNameExists`）；
+/// `on_unique` 在匹配到时调用，可返回具体业务错误（如 `ProjectNameExists`）；
 /// 未匹配则原样返回 `sqlx::Error`。
 pub fn map_unique_err<F>(e: sqlx::Error, on_unique: F) -> AppError
 where

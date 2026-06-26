@@ -36,12 +36,13 @@ export const PROJECT_TYPE_LABELS: Record<ProjectType, string> = {
 export interface Project {
   id: number
   name: string
-  group_id: number | null
   /** Rust 字段为 `r#type`，serde 序列化为 `type` */
   type: ProjectType
   path: string
   /** 运行时工作目录（null 时用 path） */
   workdir: string | null
+  /** 扫描根目录（扫描添加时记录，前端按此分面板展示；手动添加可空） */
+  scan_root: string | null
   start_cmd: string
   build_cmd: string | null
   /** 端口字符串数组（DB 存为 JSON TEXT） */
@@ -52,16 +53,19 @@ export interface Project {
   last_stop_time: string | null
   create_time: string
   update_time: string
+  /** 同一扫描目录面板内的排序值（list 时按 sort_order ASC, id ASC） */
+  sort_order: number
 }
 
 /** 新建/更新项目入参（对齐 Rust `ProjectInput`，不含 id / 时间戳） */
 export interface ProjectInput {
   name: string
-  group_id: number | null
   type: ProjectType
   path: string
   /** 运行时工作目录（可选，null 时用 path） */
   workdir: string | null
+  /** 扫描根目录（可选） */
+  scan_root: string | null
   start_cmd: string
   build_cmd: string | null
   expected_ports: string[]

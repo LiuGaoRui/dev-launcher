@@ -18,12 +18,6 @@ pub enum AppError {
     #[error("项目未运行: id={0}")]
     NotRunning(i64),
 
-    #[error("分组不存在: id={0}")]
-    GroupNotFound(i64),
-
-    #[error("分组名称已存在: {0}")]
-    GroupNameExists(String),
-
     #[error("项目名称已存在: {0}")]
     ProjectNameExists(String),
 

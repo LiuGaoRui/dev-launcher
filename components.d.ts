@@ -9,7 +9,6 @@ declare module 'vue' {
   export interface GlobalComponents {
     ActionBar: typeof import('./src/components/project/ActionBar.vue')['default']
     AppShell: typeof import('./src/components/layout/AppShell.vue')['default']
-    AppSidebar: typeof import('./src/components/layout/AppSidebar.vue')['default']
     BuildDialog: typeof import('./src/components/project/BuildDialog.vue')['default']
     MetricsBar: typeof import('./src/components/project/MetricsBar.vue')['default']
     PlaceholderPage: typeof import('./src/components/PlaceholderPage.vue')['default']

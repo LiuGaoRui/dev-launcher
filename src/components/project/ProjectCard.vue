@@ -24,6 +24,10 @@ const props = defineProps<{
   status?: ProjectStatus | null
   /** 是否有进行中的启停操作（禁用按钮） */
   busy?: boolean
+  /** 拖拽进行中（本卡正在被拖动）——半透明视觉态 */
+  dragging?: boolean
+  /** 作为拖拽放置目标——高亮边框视觉态 */
+  dragOver?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -36,6 +40,8 @@ const emit = defineEmits<{
   delete: []
   /** 点击卡片主体（进入详情） */
   open: []
+  /** 点击访问链接（用默认浏览器打开） */
+  openUrl: [url: string]
 }>()
 
 /** 健康状态：有探测结果用其 health，否则 stopped */
@@ -57,10 +63,32 @@ const stateClass = computed(() => `state-${health.value}`)
 function portsText(p: Project): string {
   return p.expected_ports.length ? p.expected_ports.join(' / ') : '-'
 }
+
+/**
+ * 运行中可访问的端口：仅保留状态探测确认在监听且为本项目占用的端口。
+ * 未监听/被占用的端口不生成访问链接（打开会失败）。
+ */
+const accessiblePorts = computed<string[]>(() => {
+  if (!running.value || !props.status) return []
+  return props.status.ports
+    .filter((p) => p.listening && p.owned)
+    .map((p) => p.port)
+})
+
+/** 由端口拼出访问 URL */
+function urlOf(port: string): string {
+  return `http://localhost:${port}`
+}
 </script>
 
 <template>
-  <div class="project-card" :class="stateClass" @click="emit('open')">
+  <div
+    class="project-card"
+    :class="[stateClass, { 'dragging': dragging, 'drag-over': dragOver }]"
+    draggable="true"
+    :data-project-id="props.project.id"
+    @click="emit('open')"
+  >
     <!-- 头部：图标 + 名称 + 类型标签 + 状态 -->
     <div class="card-head">
       <NIcon class="type-icon" size="16">
@@ -89,6 +117,25 @@ function portsText(p: Project): string {
         <span class="meta-label">端口</span>
         <span class="meta-value">{{ portsText(props.project) }}</span>
         <span v-if="pid" class="pid">PID {{ pid }}</span>
+      </div>
+    </div>
+
+    <!-- 运行中可访问链接：点击用默认浏览器打开 -->
+    <div v-if="accessiblePorts.length" class="meta links-row" @click.stop>
+      <div class="meta-row">
+        <span class="meta-label">访问</span>
+        <span class="link-list">
+          <a
+            v-for="port in accessiblePorts"
+            :key="port"
+            class="access-link"
+            :href="urlOf(port)"
+            :title="`用默认浏览器打开 ${urlOf(port)}`"
+            @click.prevent="emit('openUrl', urlOf(port))"
+          >
+            {{ urlOf(port) }}
+          </a>
+        </span>
       </div>
     </div>
 
@@ -151,6 +198,15 @@ function portsText(p: Project): string {
 .project-card:hover {
   border-color: var(--card-hover-border);
   background: var(--card-hover-bg);
+}
+
+/* 拖拽视觉态 */
+.project-card.dragging {
+  opacity: 0.45;
+}
+.project-card.drag-over {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent);
 }
 
 /* 头部 */
@@ -231,6 +287,30 @@ function portsText(p: Project): string {
   border-radius: 3px;
   font-family: var(--code-font);
   flex-shrink: 0;
+}
+
+/* 运行中访问链接 */
+.links-row {
+  gap: 0;
+}
+.link-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  min-width: 0;
+}
+.access-link {
+  font-family: var(--code-font);
+  font-size: 12px;
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px dashed transparent;
+  transition: border-color 0.12s, opacity 0.12s;
+  cursor: pointer;
+}
+.access-link:hover {
+  border-bottom-color: var(--accent);
+  opacity: 0.85;
 }
 
 /* 操作条 */

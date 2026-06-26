@@ -30,17 +30,12 @@ import {
   type ProjectInput,
   type ProjectType,
 } from '@/types/project'
-import type { Group } from '@/types/group'
 import { parsePorts } from '@/utils/ports'
 
 const props = defineProps<{
   modelValue: boolean
   /** 编辑模式时传入原项目；新建模式传 null */
   project?: Project | null
-  /** 可选分组列表（供下拉） */
-  groups: Group[]
-  /** 新建模式下的默认分组（如在分组 tab 内点新建时预选） */
-  defaultGroupId?: number | null
   /** 提交中 */
   submitting?: boolean
 }>()
@@ -55,11 +50,12 @@ const emit = defineEmits<{
 
 interface FormState {
   name: string
-  group_id: number | null
   type: ProjectType
   path: string
   /** 运行时工作目录（空=用 path） */
   workdir: string
+  /** 扫描根目录（空=不归属任何扫描目录面板） */
+  scan_root: string
   start_cmd: string
   build_cmd: string
   expected_ports: string // 输入用逗号分隔，提交时拆数组
@@ -68,10 +64,10 @@ interface FormState {
 
 const EMPTY_FORM: FormState = {
   name: '',
-  group_id: null,
   type: 'custom',
   path: '',
   workdir: '',
+  scan_root: '',
   start_cmd: '',
   build_cmd: '',
   expected_ports: '',
@@ -89,9 +85,6 @@ const visible = computed({
   set: (v: boolean) => emit('update:modelValue', v),
 })
 
-// 分组下拉选项（含「不分组」空选项）
-const groupOptions = computed(() => props.groups.map((g) => ({ label: g.name, value: g.id })))
-
 // dialog 打开时同步表单
 watch(
   () => props.modelValue,
@@ -99,18 +92,16 @@ watch(
     if (!open) return
     if (props.project) {
       form.name = props.project.name
-      form.group_id = props.project.group_id
       form.type = props.project.type
       form.path = props.project.path
       form.workdir = props.project.workdir ?? ''
+      form.scan_root = props.project.scan_root ?? ''
       form.start_cmd = props.project.start_cmd
       form.build_cmd = props.project.build_cmd ?? ''
       form.expected_ports = props.project.expected_ports.join(', ')
       form.enabled = props.project.enabled
     } else {
       Object.assign(form, { ...EMPTY_FORM })
-      // 应用默认分组（如在分组 tab 内点新建）
-      form.group_id = props.defaultGroupId ?? null
     }
     formRef.value?.restoreValidation()
   },
@@ -169,10 +160,10 @@ function buildInput(): ProjectInput {
   const ports = parsePorts(form.expected_ports)
   return {
     name: form.name.trim(),
-    group_id: form.group_id,
     type: form.type,
     path: form.path.trim(),
     workdir: form.workdir.trim() || null,
+    scan_root: form.scan_root.trim() || null,
     start_cmd: form.start_cmd.trim(),
     build_cmd: form.build_cmd.trim() || null,
     expected_ports: ports,
@@ -217,11 +208,10 @@ function handleClose() {
         <NSelect v-model:value="form.type" :options="PROJECT_TYPE_OPTIONS" placeholder="选择类型" />
       </NFormItem>
 
-      <NFormItem label="所属分组" path="group_id">
-        <NSelect
-          v-model:value="form.group_id"
-          :options="groupOptions"
-          placeholder="不分组"
+      <NFormItem label="扫描目录" path="scan_root">
+        <NInput
+          v-model:value="form.scan_root"
+          placeholder="扫描添加时自动填写；手动添加可留空"
           clearable
         />
       </NFormItem>

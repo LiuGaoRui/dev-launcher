@@ -130,10 +130,10 @@ mod integration_tests {
         Project {
             id: 1,
             name: "integration-test".into(),
-            group_id: None,
             r#type: ProjectType::Custom,
             path: ".".into(),
             workdir: None,
+            scan_root: None,
             start_cmd: cmd.into(),
             build_cmd: None,
             expected_ports: vec![],
@@ -143,6 +143,7 @@ mod integration_tests {
             last_stop_time: None,
             create_time: String::new(),
             update_time: String::new(),
+            sort_order: 0,
         }
     }
 

@@ -15,9 +15,11 @@ import {
   createProject,
   updateProject,
   deleteProject,
+  reorderProjects,
 } from '@/api/project'
 import { startProject, stopProject, restartProject } from '@/api/process'
 import { probeStatuses } from '@/api/monitor'
+import { listScanRootOrder, reorderScanRoots } from '@/api/scan_root'
 import type { Project, ProjectInput } from '@/types/project'
 import type { HealthStatus, ProjectStatus } from '@/types/monitor'
 import { safeCall } from '@/api/invoke'
@@ -32,6 +34,9 @@ export const useProjectStore = defineStore('project', () => {
   /** 运行中项目的探测结果：project_id → ProjectStatus。不在表中的 id 视为 stopped。 */
   const statuses = ref<Record<number, ProjectStatus>>({})
 
+  /** 扫描目录（面板）的排序记录：scan_root → sort_order。未记录的目录前端按字母序兜底。 */
+  const scanRootOrder = ref<Record<string, number>>({})
+
   /** 轮询定时器句柄（null 表示未在轮询） */
   let pollTimer: ReturnType<typeof setInterval> | null = null
   /** 防止并发 probe（上一轮未完成时跳过） */
@@ -45,11 +50,20 @@ export const useProjectStore = defineStore('project', () => {
     }
   }
 
-  /** 拉取项目列表 */
-  async function fetchAll(groupId?: number | null) {
+  /** 拉取项目列表 + 扫描目录排序 */
+  async function fetchAll() {
     loading.value = true
     try {
-      projects.value = await listProjects(groupId)
+      const [list, order] = await Promise.all([
+        listProjects(),
+        listScanRootOrder(),
+      ])
+      // 预 trim scan_root，避免 panels computed 每次重算都 trim
+      for (const p of list) {
+        if (p.scan_root) p.scan_root = p.scan_root.trim() || null
+      }
+      projects.value = list
+      scanRootOrder.value = order
     } finally {
       loading.value = false
     }
@@ -160,17 +174,43 @@ export const useProjectStore = defineStore('project', () => {
     return safeCall(fn)
   }
 
-  /** 分组被删除时，清理本 store 中对应项目的 group_id 引用（DB 已由 ON DELETE SET NULL 兜底） */
-  function onGroupDeleted(groupId: number) {
-    for (const p of projects.value) {
-      if (p.group_id === groupId) p.group_id = null
-    }
+  // ===== 排序（拖拽） =====
+
+  /**
+   * 重排项目顺序：先持久化到 DB，再本地重排 projects 数组。
+   * @param ids 新顺序下的项目 id 数组（仅含被拖动面板内的项目）
+   */
+  async function reorderProjectsOrder(ids: number[]) {
+    await reorderProjects(ids)
+    // 本地重排：按 ids 顺序重排 projects 数组中对应项的位置
+    const idIndex = new Map(ids.map((id, i) => [id, i]))
+    const origIndex = new Map(projects.value.map((p, i) => [p.id, i]))
+    projects.value.sort((a, b) => {
+      const ai = idIndex.get(a.id)
+      const bi = idIndex.get(b.id)
+      if (ai !== undefined && bi !== undefined) return ai - bi
+      if (ai !== undefined) return -1
+      if (bi !== undefined) return 1
+      return (origIndex.get(a.id) ?? 0) - (origIndex.get(b.id) ?? 0)
+    })
+  }
+
+  /**
+   * 重排扫描目录（面板）顺序：先持久化到 DB，再更新本地 scanRootOrder 缓存。
+   * @param roots 新顺序下的扫描目录路径数组
+   */
+  async function reorderScanRootsOrder(roots: string[]) {
+    await reorderScanRoots(roots)
+    const map: Record<string, number> = {}
+    roots.forEach((r, i) => (map[r] = i))
+    scanRootOrder.value = map
   }
 
   return {
     projects,
     loading,
     statuses,
+    scanRootOrder,
     fetchAll,
     add,
     patch,
@@ -186,6 +226,7 @@ export const useProjectStore = defineStore('project', () => {
     runningCount,
     totalCount,
     safe,
-    onGroupDeleted,
+    reorderProjectsOrder,
+    reorderScanRootsOrder,
   }
 })

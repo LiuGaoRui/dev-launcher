@@ -10,32 +10,6 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Type};
 use strum::Display;
 
-// ===== group =====
-
-/// 项目分组
-#[derive(Debug, Clone, Serialize, FromRow)]
-pub struct Group {
-    pub id: i64,
-    pub name: String,
-    /// 排序值（升序），DDL 中 `order` 是关键字，sqlx 用反引号列别名映射
-    #[sqlx(rename = "order")]
-    pub order: i32,
-    pub create_time: String,
-}
-
-/// 新建分组的输入
-#[derive(Debug, Clone, Deserialize)]
-pub struct GroupInput {
-    pub name: String,
-}
-
-/// 更新分组的输入：name / order 均可选
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct GroupUpdate {
-    pub name: Option<String>,
-    pub order: Option<i32>,
-}
-
 // ===== project =====
 
 /// 项目类型枚举，与 DDL CHECK 约束一一对应。
@@ -81,11 +55,12 @@ impl Default for ProjectType {
 pub struct Project {
     pub id: i64,
     pub name: String,
-    pub group_id: Option<i64>,
     pub r#type: ProjectType,
     pub path: String,
     /// 运行时工作目录（可选）。空 → 用 path；有值 → spawn 用此作 current_dir。
     pub workdir: Option<String>,
+    /// 扫描根目录（可选）。扫描添加时记录，前端按此分面板展示；手动添加可空。
+    pub scan_root: Option<String>,
     pub start_cmd: String,
     pub build_cmd: Option<String>,
     /// 端口列表（JSON 数组存 TEXT 列）
@@ -97,18 +72,22 @@ pub struct Project {
     pub last_stop_time: Option<String>,
     pub create_time: String,
     pub update_time: String,
+    /// 同一扫描目录面板内的排序值（list 时按 sort_order ASC, id ASC）
+    pub sort_order: i64,
 }
 
 /// 新建/更新项目的输入（不含 id / 时间戳，由 DB 生成）
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProjectInput {
     pub name: String,
-    pub group_id: Option<i64>,
     pub r#type: ProjectType,
     pub path: String,
     /// 运行时工作目录（可选）
     #[serde(default)]
     pub workdir: Option<String>,
+    /// 扫描根目录（可选）
+    #[serde(default)]
+    pub scan_root: Option<String>,
     pub start_cmd: String,
     pub build_cmd: Option<String>,
     #[serde(default)]
