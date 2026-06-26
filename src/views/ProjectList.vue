@@ -14,6 +14,7 @@ import { useBuildStore } from '@/stores/build'
 import type { Project, ProjectInput } from '@/types/project'
 import ProjectCard from '@/components/project/ProjectCard.vue'
 import ProjectFormDialog from '@/components/project/ProjectFormDialog.vue'
+import ProjectScanDialog from '@/components/project/ProjectScanDialog.vue'
 import BuildDialog from '@/components/project/BuildDialog.vue'
 
 const groupStore = useGroupStore()
@@ -209,11 +210,20 @@ async function handleDelete(p: Project) {
 
 // ===== 新建/编辑 Dialog =====
 
+// 扫描向导弹窗
+const scanVisible = ref(false)
+// 单项目表单弹窗（手动添加 / 编辑）
 const dialogVisible = ref(false)
 const editingProject = ref<Project | null>(null)
 const submitting = ref(false)
 
 function openCreate() {
+  // 「+ 新建项目」打开扫描向导
+  scanVisible.value = true
+}
+
+/** 扫描弹窗内点「手动添加」→ 打开原表单（create 模式空表单） */
+function handleManualCreate() {
   editingProject.value = null
   dialogVisible.value = true
 }
@@ -302,7 +312,7 @@ async function stopAll() {
     <NRadioGroup
       :value="activeGroup"
       size="small"
-      @update:value="(v) => activeGroup = v"
+      @update:value="(v: number | null) => activeGroup = v"
     >
       <NRadioButton
         v-for="tab in groupTabs"
@@ -341,7 +351,14 @@ async function stopAll() {
       class="empty-state"
     />
 
-    <!-- 新建/编辑对话框 -->
+    <!-- 扫描向导（点「+ 新建项目」打开） -->
+    <ProjectScanDialog
+      v-model="scanVisible"
+      :default-group-id="activeGroup && activeGroup > 0 ? activeGroup : null"
+      @manual="handleManualCreate"
+    />
+
+    <!-- 新建/编辑对话框（手动添加 / 编辑已有项目） -->
     <ProjectFormDialog
       v-model="dialogVisible"
       :project="editingProject"

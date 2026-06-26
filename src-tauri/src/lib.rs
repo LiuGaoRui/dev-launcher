@@ -50,6 +50,8 @@ pub fn run() {
             commands::project::create_project,
             commands::project::update_project,
             commands::project::delete_project,
+            // detect
+            commands::detect::scan_projects,
             // process
             commands::process::start_project,
             commands::process::stop_project,

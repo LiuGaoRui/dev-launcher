@@ -31,6 +31,7 @@ import {
   type ProjectType,
 } from '@/types/project'
 import type { Group } from '@/types/group'
+import { parsePorts } from '@/utils/ports'
 
 const props = defineProps<{
   modelValue: boolean
@@ -145,10 +146,7 @@ async function pickDirectory() {
 
 /** 把 FormState 转成 Rust 端 ProjectInput（snake_case） */
 function buildInput(): ProjectInput {
-  const ports = form.expected_ports
-    .split(/[,，\s]+/)
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0)
+  const ports = parsePorts(form.expected_ports)
   return {
     name: form.name.trim(),
     group_id: form.group_id,

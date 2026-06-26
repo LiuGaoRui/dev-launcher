@@ -121,3 +121,40 @@ fn default_enabled() -> bool {
 pub fn now_iso() -> String {
     Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
+
+// ===== 项目自动检测（scan_projects 命令返回值，不入库） =====
+
+/// 扫描根目录检测到的项目。
+///
+/// 仅用于 Rust→前端展示，用户勾选后由前端转成 `ProjectInput` 调
+/// `create_project` 入库，故只需 `Serialize`。
+#[derive(Debug, Clone, Serialize)]
+pub struct DetectedProject {
+    /// 相对根目录的展示路径，如 "backend/hr-service"
+    pub rel_path: String,
+    /// 绝对路径（→ project.path）
+    pub path: String,
+    /// 推断的项目名（package.json name / pom artifactId / 目录名）
+    pub name: String,
+    /// 项目类型（springboot | java_jar | node）
+    pub r#type: ProjectType,
+    /// 推断的端口列表
+    pub expected_ports: Vec<String>,
+    /// 候选启动方案（前端下拉选择）
+    pub schemes: Vec<LaunchScheme>,
+}
+
+/// 启动方案：一对 (start_cmd, build_cmd) + 人类可读说明。
+#[derive(Debug, Clone, Serialize)]
+pub struct LaunchScheme {
+    /// 方案名，如 "开发模式" / "打包运行模式"
+    pub label: String,
+    /// 是否推荐方案（前端默认选中）
+    pub recommended: bool,
+    /// 启动命令
+    pub start_cmd: String,
+    /// 构建命令（可选）
+    pub build_cmd: Option<String>,
+    /// 方案说明（前端 tooltip / 占位提示）
+    pub description: String,
+}
