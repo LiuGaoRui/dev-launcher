@@ -23,7 +23,6 @@ import {
   NRadioButton,
   NSelect,
   NButton,
-  useMessage,
   useDialog,
 } from 'naive-ui'
 import { getProject } from '@/api/project'
@@ -37,7 +36,6 @@ const route = useRoute()
 const router = useRouter()
 const projectStore = useProjectStore()
 const logStore = useLogStore()
-const message = useMessage()
 const dialog = useDialog()
 
 const projectId = computed(() => Number(route.params.id))
@@ -131,8 +129,7 @@ async function handleClear() {
     positiveText: '清空',
     negativeText: '取消',
     onPositiveClick: async () => {
-      const ok = await logStore.clear(projectId.value)
-      if (ok) message.success('已清空当日日志')
+      await logStore.clear(projectId.value)
     },
   })
 }

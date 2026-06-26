@@ -129,11 +129,6 @@ async function handleScan() {
       // 默认全选
       checkedPaths.value.add(d.path)
     }
-    if (list.length === 0) {
-      message.info('未在该目录下检测到可识别的 Java / Node 项目')
-    } else {
-      message.success(`检测到 ${list.length} 个项目`)
-    }
   } catch (e) {
     message.error(`扫描失败：${e instanceof Error ? e.message : String(e)}`)
   } finally {
@@ -223,7 +218,6 @@ async function handleAdd() {
   }
   adding.value = false
   if (ok > 0) {
-    message.success(`已添加 ${ok} 个项目${fail > 0 ? `，${fail} 个失败` : ''}`)
     emit('done', ok)
     visible.value = false
   } else if (fail > 0) {

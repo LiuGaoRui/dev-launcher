@@ -19,21 +19,38 @@ use crate::error::{AppError, AppResult};
 use crate::models::{DetectedProject, LaunchScheme, ProjectType};
 
 /// 扫描跳过的目录名（不分大小写匹配）。
+///
+/// 分两类：
+/// - 依赖/产物目录：node_modules、target、dist 等，体积大且从不含项目源码
+/// - 数据/临时目录：data、repos、logs、tmp 等，常被克隆仓库或运行时产物污染，
+///   如「审查Agent」项目的 data/repos/ 下有 82 个无关 hanxiinfotech 模块 pom.xml
 const SKIP_DIRS: &[&str] = &[
+    // 依赖与构建产物
     "node_modules",
     "target",
-    ".git",
     "dist",
     "build",
-    ".idea",
     ".gradle",
-    "__pycache__",
     ".next",
     ".nuxt",
-    ".vscode",
-    ".cache",
+    "__pycache__",
     "venv",
     ".venv",
+    "coverage",
+    // IDE / VCS
+    ".git",
+    ".idea",
+    ".vscode",
+    ".cache",
+    // 数据 / 日志 / 临时（防止克隆仓库、运行时产物等污染扫描结果）
+    "data",
+    "repos",
+    "logs",
+    "log",
+    "tmp",
+    "temp",
+    "bin",
+    "out",
 ];
 
 /// DFS 最大深度（根目录为第 0 层）。
@@ -135,7 +152,8 @@ impl DetectService {
             match Self::detect_maven(root, dir)? {
                 Some(MavenProbe::Project(d)) => {
                     out.push(d);
-                    return Ok(());
+                    // 不 return：继续下钻子目录，以便发现同项目下的前端（如 web/package.json）
+                    // 等其他类型子项目。SKIP_DIRS + MAX_DEPTH 已限制扫描范围。
                 }
                 Some(MavenProbe::Library) => { /* 纯类库 jar，不入结果，停止下钻 */ }
                 Some(MavenProbe::Aggregator) => { /* monorepo 容器：继续下钻子目录 */ }
@@ -149,7 +167,8 @@ impl DetectService {
                         // monorepo 根：继续下钻找子包
                     } else if let Some(detected) = Self::detect_node(root, dir, &pkg)? {
                         out.push(detected);
-                        return Ok(());
+                        // 不 return：继续下钻子目录，以便发现同项目下的后端（如 server/）
+                        // 等其他类型子项目。SKIP_DIRS + MAX_DEPTH 已限制扫描范围。
                     }
                 }
             }
@@ -275,12 +294,18 @@ impl DetectService {
         }
         // 其他框架只有默认值，无配置文件可读
         if has("@angular/cli") {
-            vec!["4200".to_string()]
+            return vec!["4200".to_string()];
         } else if has("next") || has("react-scripts") || has("nuxt") {
-            vec!["3000".to_string()]
-        } else {
-            Vec::new()
+            return vec!["3000".to_string()];
         }
+
+        // 兜底：扫描源码中的监听端口（Express/Fastify/Koa 等纯后端）
+        // 匹配 process.env.PORT || 3001、app.listen(3001 等常见写法
+        if let Some(p) = scan_source_port(dir) {
+            return vec![p];
+        }
+
+        Vec::new()
     }
 
     // ===== Maven 检测 =====
@@ -523,6 +548,10 @@ lazy_regex!(fallback_port_re, r"\|\|\s*(\d{2,5})\b");
 lazy_regex!(port_key_value_re, r"(?m)\bport\s*:\s*(\d{2,5})\b");
 lazy_regex!(main_re, r"public\s+static\s+void\s+main\s*\(\s*String\s*\[\s*\]\s*\w+\s*\)");
 lazy_regex!(java_comment_re, r"//[^\n]*|/\*[\s\S]*?\*/");
+// Node 后端源码端口：process.env.PORT || 3001
+lazy_regex!(env_port_re, r"process\.env\.PORT\s*\|\|\s*(\d{2,5})");
+// Node 后端源码端口：app.listen(3001 / server.listen( 3000
+lazy_regex!(listen_port_re, r"\.listen\s*\(\s*(\d{2,5})");
 
 /// 读取并解析 package.json；读失败或非法 JSON 返回 None。
 fn read_pkg_json(path: &Path) -> Option<serde_json::Value> {
@@ -553,6 +582,88 @@ fn read_port_from_vite_config(dir: &Path) -> Option<String> {
         if let Ok(content) = std::fs::read_to_string(dir.join(fname)) {
             if let Some(port) = extract_port_from_config(&content) {
                 return Some(port);
+            }
+        }
+    }
+    None
+}
+
+/// 兜底：扫描 Node 后端源码（src/ 下）中的监听端口。
+///
+/// 适用于无框架特征（非 vite/vue/next）的纯后端（Express/Fastify/Koa）项目，
+/// 其端口常硬编码在源码里。匹配两种写法：
+/// - `process.env.PORT || 3001`（环境变量兜底常量）
+/// - `app.listen(3001` / `server.listen( 3001`（直接传入数字）
+///
+/// 多文件按「index/main 优先 + 字典序」排序，取第一个命中，符合 Node 入口惯例。
+fn scan_source_port(dir: &Path) -> Option<String> {
+    let src = dir.join("src");
+    let src_dir = if src.is_dir() {
+        src
+    } else {
+        // 无 src/ 时退到项目根目录（部分项目源码直接在根目录）
+        dir.to_path_buf()
+    };
+
+    // 收集 src/ 下（仅一层，避免深递归）的 js/ts/mjs/cjs 文件
+    let mut files: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&src_dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                let p = entry.path();
+                if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                    if matches!(ext, "js" | "ts" | "mjs" | "cjs") {
+                        files.push(p);
+                    }
+                }
+            }
+        }
+    }
+    if files.is_empty() {
+        return None;
+    }
+
+    // index.* / main.* 优先，其余按文件名字典序；保证稳定且符合入口惯例
+    files.sort_by(|a, b| {
+        let an = a
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let bn = b
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let prio = |n: &str| match n {
+            "index" => 0,
+            "main" => 1,
+            "app" => 2,
+            "server" => 3,
+            _ => 9,
+        };
+        prio(&an)
+            .cmp(&prio(&bn))
+            .then_with(|| an.cmp(&bn))
+    });
+
+    let re_env_port = env_port_re();
+    let re_listen = listen_port_re();
+    for file in &files {
+        if let Ok(content) = std::fs::read_to_string(file) {
+            // 先匹配 process.env.PORT || N（语义最明确）
+            if let Some(p) = re_env_port
+                .captures(&content)
+                .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
+            {
+                return Some(p);
+            }
+            // 再匹配 .listen( N
+            if let Some(p) = re_listen
+                .captures(&content)
+                .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
+            {
+                return Some(p);
             }
         }
     }
@@ -1437,5 +1548,161 @@ public class Main {
         // 两个 profile 的端口都应出现
         assert!(detected[0].expected_ports.contains(&"8080".to_string()));
         assert!(detected[0].expected_ports.contains(&"18080".to_string()));
+    }
+
+    #[tokio::test]
+    async fn scan_skips_data_and_repos_dirs() {
+        // data/、repos/、logs/ 等数据目录下的克隆仓库不应被扫描
+        // 模拟「审查Agent」场景：真实项目在根，data/repos 下有克隆的 pom.xml
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+
+        // 真实后端项目（根 pom）
+        write(
+            &root.join("pom.xml"),
+            r#"<project>
+  <parent><groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.3.4</version></parent>
+  <artifactId>real-app</artifactId>
+</project>"#,
+        );
+        write_springboot_main(root, "com/example", "RealAppApplication");
+        write(
+            &root.join("src/main/resources/application.yml"),
+            "server:\n  port: 8388\n",
+        );
+
+        // data/repos 下的克隆仓库（应被跳过，不产生检测结果）
+        write(
+            &root.join("data/repos/1/pom.xml"),
+            r#"<project>
+  <artifactId>cloned-aggregator</artifactId>
+  <packaging>pom</packaging>
+</project>"#,
+        );
+        write_springboot_main(&root.join("data/repos/1/fake-svc"), "com/x", "FakeSvc");
+        write(
+            &root.join("data/repos/1/fake-svc/pom.xml"),
+            r#"<project><artifactId>fake-svc</artifactId></project>"#,
+        );
+        write(
+            &root.join("data/repos/1/fake-svc/src/main/resources/application.properties"),
+            "server.port=9999\n",
+        );
+
+        let detected = DetectService::scan(&root.to_string_lossy()).await.unwrap();
+        // 只应扫到根的真实项目，data/repos 下的克隆项目被跳过
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0].name, "real-app");
+        assert!(detected.iter().all(|d| d.name != "fake-svc"));
+    }
+
+    #[tokio::test]
+    async fn scan_finds_frontend_after_springboot() {
+        // pom 命中后应继续下钻，发现同项目下的 web/ 前端子项目
+        // 模拟「审查Agent」场景：根 SpringBoot + web/package.json (Vue)
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+
+        // 根 SpringBoot
+        write(
+            &root.join("pom.xml"),
+            r#"<project>
+  <parent><groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.3.4</version></parent>
+  <artifactId>review-agent</artifactId>
+</project>"#,
+        );
+        write_springboot_main(root, "com/review", "ReviewAgentApplication");
+        write(
+            &root.join("src/main/resources/application.yml"),
+            "server:\n  port: 8388\n",
+        );
+
+        // web 前端子项目（应被继续下钻扫到）
+        write(
+            &root.join("web/package.json"),
+            r#"{"name":"review-agent-web","scripts":{"dev":"vite"},"devDependencies":{"vite":"^5.0.0"}}"#,
+        );
+
+        let detected = DetectService::scan(&root.to_string_lossy()).await.unwrap();
+        // 2 个项目：后端 + 前端
+        assert_eq!(detected.len(), 2);
+        assert!(detected.iter().any(|d| d.name == "review-agent"));
+        assert!(detected.iter().any(|d| d.name == "review-agent-web"));
+    }
+
+    #[tokio::test]
+    async fn scan_finds_server_and_web_after_root_pkg() {
+        // 根 package.json 命中后应继续下钻，发现 server/ 和 web/ 子项目
+        // 模拟「AI代理」场景：根 Node + server/ + web/ 子项目
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+
+        // 根 Node 项目（有 dev 脚本，非 workspace）
+        write(
+            &root.join("package.json"),
+            r#"{"name":"proxy-root","scripts":{"dev":"cd server && node src/index.js"}}"#,
+        );
+        // server 后端
+        write(
+            &root.join("server/package.json"),
+            r#"{"name":"proxy-server","scripts":{"start":"node src/index.js"}}"#,
+        );
+        // web 前端
+        write(
+            &root.join("web/package.json"),
+            r#"{"name":"proxy-web","scripts":{"dev":"vite"},"devDependencies":{"vite":"^5.0.0"}}"#,
+        );
+
+        let detected = DetectService::scan(&root.to_string_lossy()).await.unwrap();
+        // 3 个项目：根 + server + web
+        assert_eq!(detected.len(), 3);
+        let names: Vec<&str> = detected.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"proxy-root"));
+        assert!(names.contains(&"proxy-server"));
+        assert!(names.contains(&"proxy-web"));
+    }
+
+    #[tokio::test]
+    async fn scan_source_port_env_fallback() {
+        // 纯后端 Node 项目：端口在源码 process.env.PORT || 3001
+        // 模拟「AI测试」server 场景
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            &root.join("server/package.json"),
+            r#"{"name":"hr-server","scripts":{"start":"node src/index.js"},"dependencies":{"express":"^4.0.0"}}"#,
+        );
+        write(
+            &root.join("server/src/index.js"),
+            "const PORT = process.env.PORT || 3001;\napp.listen(PORT, () => {});\n",
+        );
+
+        let detected = DetectService::scan(&root.to_string_lossy()).await.unwrap();
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0].expected_ports, vec!["3001".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn scan_source_port_listen_direct() {
+        // 纯后端 Node 项目：端口在 .listen(3000)
+        // 模拟「AI代理」server 场景（Fastify 直接 listen 数字）
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            &root.join("server/package.json"),
+            r#"{"name":"fastify-server","scripts":{"start":"node src/app.js"}}"#,
+        );
+        write(
+            &root.join("server/src/app.js"),
+            "const fastify = Fastify();\nfastify.listen(3000, '0.0.0.0');\n",
+        );
+
+        let detected = DetectService::scan(&root.to_string_lossy()).await.unwrap();
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0].expected_ports, vec!["3000".to_string()]);
     }
 }

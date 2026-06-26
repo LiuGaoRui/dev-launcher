@@ -124,8 +124,6 @@ impl ProjectService {
     }
 
     /// 删除项目。
-    ///
-    /// TODO(阶段 2)：接入 ProcessRegistry 后，运行中拒绝删除（返回 AlreadyRunning）。
     pub async fn delete(pool: &sqlx::Pool<Sqlite>, id: i64) -> AppResult<()> {
         Self::get(pool, id).await?;
         sqlx::query("DELETE FROM project WHERE id = ?")

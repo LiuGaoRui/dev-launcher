@@ -65,14 +65,7 @@ const emit = defineEmits<{
       发布
     </NButton>
     <NButton size="tiny" quaternary :disabled="busy" @click="emit('edit')">编辑</NButton>
-    <NButton
-      size="tiny"
-      quaternary
-      type="error"
-      :disabled="busy || running"
-      :title="running ? '请先停止项目再删除' : '删除项目'"
-      @click="emit('delete')"
-    >
+    <NButton size="tiny" quaternary type="error" :disabled="busy" @click="emit('delete')">
       删除
     </NButton>
   </div>

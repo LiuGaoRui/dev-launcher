@@ -97,19 +97,16 @@ function openDetail(p: Project) {
 async function handleStart(p: Project) {
   const [, err] = await withBusy(p.id, () => projectStore.start(p.id))
   if (err) message.error(`启动失败：${err}`)
-  else message.success(`「${p.name}」已启动（PID ${(projectStore.projects.find((x) => x.id === p.id)?.last_pid) ?? '-'}）`)
 }
 
 async function handleStop(p: Project) {
   const [, err] = await withBusy(p.id, () => projectStore.stop(p.id))
   if (err) message.error(`停止失败：${err}`)
-  else message.success(`「${p.name}」已停止`)
 }
 
 async function handleRestart(p: Project) {
   const [, err] = await withBusy(p.id, () => projectStore.restart(p.id))
   if (err) message.error(`重启失败：${err}`)
-  else message.success(`「${p.name}」已重启`)
 }
 
 // ===== 构建 / 一键发布（阶段 7） =====
@@ -180,7 +177,6 @@ async function handleDeploy(p: Project) {
           message.error(`构建成功但启动失败：${startErr}`)
           return
         }
-        message.success(`「${p.name}」发布完成`)
       } finally {
         setBusy(p.id, false)
       }
@@ -191,10 +187,6 @@ async function handleDeploy(p: Project) {
 // ===== 删除 =====
 
 async function handleDelete(p: Project) {
-  if (projectStore.isRunning(p.id)) {
-    message.warning('项目运行中，请先停止再删除')
-    return
-  }
   dialog.warning({
     title: '删除确认',
     content: `确定删除项目「${p.name}」吗？此操作不可恢复。`,
@@ -203,7 +195,6 @@ async function handleDelete(p: Project) {
     onPositiveClick: async () => {
       const [, err] = await projectStore.safe(() => projectStore.remove(p.id))
       if (err) message.error(`删除失败：${err}`)
-      else message.success(`已删除「${p.name}」`)
     },
   })
 }
@@ -242,7 +233,7 @@ async function handleSubmitForm(input: ProjectInput, origin: Project | null) {
       message.error(`保存失败：${err}`)
       return
     }
-    message.success(`已更新「${input.name}」`)
+    dialogVisible.value = false
   } else {
     const [created, err] = await projectStore.safe(() => projectStore.add(input))
     submitting.value = false
@@ -250,9 +241,8 @@ async function handleSubmitForm(input: ProjectInput, origin: Project | null) {
       message.error(`创建失败：${err}`)
       return
     }
-    message.success(`已创建「${created.name}」`)
+    dialogVisible.value = false
   }
-  dialogVisible.value = false
 }
 
 // ===== 批量操作（全部启动/停止） =====
@@ -260,35 +250,25 @@ async function handleSubmitForm(input: ProjectInput, origin: Project | null) {
 async function startAll() {
   const targets = filteredProjects.value.filter((p) => !projectStore.isRunning(p.id))
   if (!targets.length) {
-    message.info('没有可启动的项目')
     return
   }
-  let ok = 0
   for (const p of targets) {
     const [, err] = await projectStore.safe(() => projectStore.start(p.id))
     if (err) message.error(`「${p.name}」启动失败：${err}`)
-    else ok++
   }
   await projectStore.probeNow()
-  if (ok === targets.length) message.success(`已启动 ${ok} 个项目`)
-  else message.warning(`已启动 ${ok}/${targets.length} 个项目`)
 }
 
 async function stopAll() {
   const targets = filteredProjects.value.filter((p) => projectStore.isRunning(p.id))
   if (!targets.length) {
-    message.info('没有运行中的项目')
     return
   }
-  let ok = 0
   for (const p of targets) {
     const [, err] = await projectStore.safe(() => projectStore.stop(p.id))
     if (err) message.error(`「${p.name}」停止失败：${err}`)
-    else ok++
   }
   await projectStore.probeNow()
-  if (ok === targets.length) message.success(`已停止 ${ok} 个项目`)
-  else message.warning(`已停止 ${ok}/${targets.length} 个项目`)
 }
 </script>
 

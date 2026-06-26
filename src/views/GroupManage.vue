@@ -70,7 +70,6 @@ async function saveRename(row: Group) {
     groupStore.patch(row.id, { name }),
   )
   if (err) message.error(`重命名失败：${err}`)
-  else message.success('已更新')
 }
 
 // ===== 排序（上移/下移） =====
@@ -105,7 +104,6 @@ async function handleDelete(row: Group) {
         return
       }
       projectStore.onGroupDeleted(row.id)
-      message.success('已删除')
     },
   })
 }
@@ -230,7 +228,6 @@ async function handleCreate() {
       message.error(`创建失败：${err}`)
       return
     }
-    message.success('分组已创建')
     createForm.name = ''
     createFormRef.value?.restoreValidation()
   })
