@@ -183,9 +183,36 @@ impl DetectService {
 
     // ===== Node 检测 =====
 
-    /// 判断 package.json 是否为 monorepo workspace 根。
+    /// 判断 package.json 是否为 monorepo 容器根（不入结果，继续下钻找子项目）。
+    ///
+    /// 两种形态：
+    /// 1. 标准 workspace：声明了 `workspaces` 字段（npm/yarn workspaces）
+    /// 2. 协调脚本根：无 workspaces，但所有启动脚本（dev/start/serve 等）都以
+    ///    `cd <子目录> &&` 开头——这是 monorepo 用脚本转发到子项目的常见写法，
+    ///    根本身不提供服务，扫出会和子项目重复。
     fn is_node_workspace(pkg: &serde_json::Value) -> bool {
-        pkg.get("workspaces").is_some()
+        // 形态 1：显式 workspaces 字段
+        if pkg.get("workspaces").is_some() {
+            return true;
+        }
+        // 形态 2：协调脚本根——所有脚本都 cd 到子目录
+        let Some(scripts) = pkg.get("scripts").and_then(|s| s.as_object()) else {
+            return false;
+        };
+        // 关注会启动服务的脚本键
+        let launch_keys = ["dev", "start", "serve", "web"];
+        let launch_scripts: Vec<&str> = launch_keys
+            .iter()
+            .filter_map(|k| scripts.get(*k).and_then(|v| v.as_str()))
+            .collect();
+        // 至少要有 2 个这样的脚本（单个 cd 可能是巧合，多个则强烈暗示协调脚本）
+        if launch_scripts.len() < 2 {
+            return false;
+        }
+        // 全部以 `cd <dir> &&` 开头才认定（若混有非 cd 脚本，说明根自身也提供服务）
+        launch_scripts
+            .iter()
+            .all(|s| coord_script_re().is_match(s))
     }
 
     /// 检测 Node 项目，返回 None 表示非有效项目（如无可运行脚本）。
@@ -360,11 +387,21 @@ impl DetectService {
 
         // jar 名：优先扫 target/*.jar 实际产物；其次 pom 坐标；最后占位
         let jar_name = Self::resolve_jar_name(dir, &stripped);
-        // 模块相对根目录路径（用于 java -jar 时从根目录指向模块 target）
+        // JAVA_HOME：从启动脚本提取（多 JDK 项目需要，如审查Agent 用 Java 21）
+        let java_home = Self::detect_java_home(dir);
+        // 展示用相对路径（dir==root 时为目录名）
         let mod_rel = relpath(root, dir);
+        // 命令用相对路径（dir==root 时为空串，避免 -f 审查Agent/pom.xml 误拼 + 中文乱码）
+        let cmd_rel = relpath_cmd(root, dir);
         let root_str = root.to_string_lossy().to_string();
 
-        let schemes = Self::build_maven_schemes(is_spring_boot, &jar_name, &root_str, &mod_rel);
+        let schemes = Self::build_maven_schemes(
+            is_spring_boot,
+            &jar_name,
+            &root_str,
+            &cmd_rel,
+            java_home.as_deref(),
+        );
 
         Ok(Some(MavenProbe::Project(DetectedProject {
             rel_path: mod_rel,
@@ -386,6 +423,82 @@ impl DetectService {
         // 2. pom 坐标 artifactId-version.jar
         if let Some(name) = build_coord_jar_name(pom_content) {
             return Some(name);
+        }
+        None
+    }
+
+    /// 从项目启动脚本提取 JAVA_HOME（多 JDK 项目用，如审查Agent 需 Java 21）。
+    ///
+    /// 扫描 dir 下的 `*.bat` / `*.cmd` / `*.sh` / `*.ps1`，正则匹配
+    /// `set JAVA_HOME=<路径>` / `JAVA_HOME=<路径>`（不区分大小写）。
+    /// 返回首个命中路径（去引号、去尾部注释）。无脚本或无匹配返回 None。
+    ///
+    /// 设计动机：项目作者在 start.bat/build.bat 里声明的 JAVA_HOME 是「正确 JDK 在哪」
+    /// 的权威信息；生成的命令注入它，可避免系统 PATH 指向错误 JDK（如 Java 8）。
+    fn detect_java_home(dir: &Path) -> Option<String> {
+        let entries = std::fs::read_dir(dir).ok()?;
+        // 优先扫 .bat/.cmd（Windows 主流），再 .sh/.ps1
+        let mut scripts: Vec<PathBuf> = Vec::new();
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                let p = entry.path();
+                if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                    if matches!(
+                        ext.to_lowercase().as_str(),
+                        "bat" | "cmd" | "sh" | "ps1"
+                    ) {
+                        scripts.push(p);
+                    }
+                }
+            }
+        }
+        // start.* / run.* / build.* 优先（更可能是启动脚本），其余按字典序
+        scripts.sort_by(|a, b| {
+            let prio = |n: &str| match n {
+                "start" => 0,
+                "run" => 1,
+                "build" => 2,
+                _ => 9,
+            };
+            let an = a
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let bn = b
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            prio(&an).cmp(&prio(&bn)).then_with(|| an.cmp(&bn))
+        });
+
+        let re = java_home_re();
+        for script in &scripts {
+            let Ok(content) = std::fs::read_to_string(script) else {
+                continue;
+            };
+            for line in content.lines() {
+                if let Some(c) = re.captures(line) {
+                    if let Some(m) = c.get(1) {
+                        // 去引号、去尾部注释/分号（bat 的 `set` 行尾一般干净，防御性处理）
+                        let v = m
+                            .as_str()
+                            .trim_matches('"')
+                            .trim_matches('\'')
+                            .trim();
+                        // 去掉可能的行内注释（rem :: #）
+                        let v = v
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or(v)
+                            .to_string();
+                        if !v.is_empty() {
+                            return Some(v);
+                        }
+                    }
+                }
+            }
         }
         None
     }
@@ -448,19 +561,32 @@ impl DetectService {
     /// - `is_spring_boot`：是否 SpringBoot（影响方案数量与命令）
     /// - `jar_name`：推断的 jar 文件名
     /// - `root`：扫描根目录（= workdir，License 等运行时资源在此）
-    /// - `mod_rel`：模块相对根目录的路径（如 "backend/hr"）
+    /// - `mod_rel`：模块相对根目录的**命令路径**（如 "backend/hr"）；模块即扫描根时为空串
+    /// - `java_home`：从启动脚本提取的 JAVA_HOME（多 JDK 项目用）；None 则用系统 PATH
     ///
     /// 运行目录策略（spawn current_dir 按类型区分，见 spawn.rs）：
-    /// - Java 类：current_dir = workdir（root），mvn 用 `-f <mod_rel>/pom.xml` 定位启动模块，
-    ///   fork=false 时 user.dir=root 自动找到 License；fork=true 时 workingDirectory 参数生效
+    /// - Java 类：current_dir = workdir（root），mvn 用 `-f <mod_rel>/pom.xml` 定位启动模块
+    ///   （mod_rel 为空时用 `-f pom.xml`）；fork=false 时 user.dir=root 自动找到 License；
+    ///   fork=true 时 workingDirectory 参数生效
     /// - 打包运行：current_dir = workdir（root），jar 在模块 target/ 下，用 mod_rel 指向
     fn build_maven_schemes(
         is_spring_boot: bool,
         jar_name: &Option<String>,
         root: &str,
         mod_rel: &str,
+        java_home: Option<&str>,
     ) -> Vec<LaunchScheme> {
-        let package_build = Some("mvn clean package -DskipTests".to_string());
+        // 有 JAVA_HOME 时：mvn 前加 `set "JAVA_HOME=..." && `（让 Maven 用对的 JDK 运行插件）；
+        // java 用全路径（最可靠，不依赖 PATH）。
+        let mvn_prefix = match java_home {
+            Some(jh) => format!("set \"JAVA_HOME={jh}\" && "),
+            None => String::new(),
+        };
+        let java_bin = match java_home {
+            Some(jh) => format!("\"{jh}\\bin\\java.exe\""),
+            None => "java".to_string(),
+        };
+        let package_build = Some(format!("{mvn_prefix}mvn clean package -DskipTests"));
 
         // 打包运行时 current_dir=root，jar 在模块 target/ 下，需用相对路径从 root 指向。
         // mod_rel 用 '/' 分隔（relpath 保证），Windows cmd 也接受 '/' 指向子目录。
@@ -470,13 +596,19 @@ impl DetectService {
             format!("{mod_rel}/target/")
         };
         let jar_start = match jar_name {
-            Some(j) => format!("java -jar {jar_rel_prefix}{j}"),
-            None => format!("java -jar {jar_rel_prefix}app.jar"),
+            Some(j) => format!("{java_bin} -jar {jar_rel_prefix}{j}"),
+            None => format!("{java_bin} -jar {jar_rel_prefix}app.jar"),
         };
 
-        // mvn 用 -f 定位启动模块 pom：spawn cwd=workdir(root)，模块在子目录下。
-        // mod_rel 非空（relpath 在 dir==root 时退化为目录名），故总有 <mod_rel>/pom.xml。
-        let f_param = format!("-f {mod_rel}/pom.xml ");
+        // mvn 用 -f 定位启动模块 pom：spawn cwd=workdir(root)。
+        // - 模块在子目录（mod_rel 非空）：-f <mod_rel>/pom.xml
+        // - 模块即扫描根（mod_rel 空，如「审查Agent」根目录自带 pom）：-f pom.xml
+        //   （cwd 已在根，不能再拼目录名；且避免中文目录名作为 -f 参数经 cmd.exe 乱码）
+        let f_param = if mod_rel.is_empty() {
+            "-f pom.xml ".to_string()
+        } else {
+            format!("-f {mod_rel}/pom.xml ")
+        };
 
         if is_spring_boot {
             let wd_param = format!("-Dspring-boot.run.workingDirectory=\"{root}\"");
@@ -488,7 +620,7 @@ impl DetectService {
                 LaunchScheme {
                     label: "开发模式".to_string(),
                     recommended: true,
-                    start_cmd: format!("mvn {f_param}spring-boot:run {wd_param}"),
+                    start_cmd: format!("{mvn_prefix}mvn {f_param}spring-boot:run {wd_param}"),
                     build_cmd: None,
                     description: "Maven fork 子进程运行，workingDirectory 设为项目根目录；\
                         改代码重跑即可，日常开发最快。依赖多/路径长时若报 error=206 请用内嵌运行"
@@ -499,7 +631,9 @@ impl DetectService {
                     recommended: false,
                     // fork=false 时 workingDirectory 参数被 Maven 忽略（仅 fork 模式生效），
                     // 故不写它；user.dir 由 spawn cwd（=workdir root）决定，License 在 root 能找到。
-                    start_cmd: format!("mvn {f_param}spring-boot:run -Dspring-boot.run.fork=false"),
+                    start_cmd: format!(
+                        "{mvn_prefix}mvn {f_param}spring-boot:run -Dspring-boot.run.fork=false"
+                    ),
                     build_cmd: None,
                     description: "不 fork 子进程，在 Maven 同进程内运行，规避 Windows \
                         classpath 超长（CreateProcess error=206）问题；运行时工作目录=扫描根，\
@@ -548,10 +682,14 @@ lazy_regex!(fallback_port_re, r"\|\|\s*(\d{2,5})\b");
 lazy_regex!(port_key_value_re, r"(?m)\bport\s*:\s*(\d{2,5})\b");
 lazy_regex!(main_re, r"public\s+static\s+void\s+main\s*\(\s*String\s*\[\s*\]\s*\w+\s*\)");
 lazy_regex!(java_comment_re, r"//[^\n]*|/\*[\s\S]*?\*/");
-// Node 后端源码端口：process.env.PORT || 3001
-lazy_regex!(env_port_re, r"process\.env\.PORT\s*\|\|\s*(\d{2,5})");
+// Node 后端源码端口：process.env.PORT || 3001 / '3001' / "3001"（兼容带引号字符串写法）
+lazy_regex!(env_port_re, r#"process\.env\.PORT\s*\|\|\s*['"]?(\d{2,5})['"]?"#);
 // Node 后端源码端口：app.listen(3001 / server.listen( 3000
 lazy_regex!(listen_port_re, r"\.listen\s*\(\s*(\d{2,5})");
+// 协调脚本：以 `cd <子目录> &&` 开头（monorepo 转发到子项目的常见写法）
+lazy_regex!(coord_script_re, r"^\s*cd\s+\S+\s*&&");
+// 启动脚本里的 JAVA_HOME 声明：set JAVA_HOME=... / JAVA_HOME=...（不区分大小写）
+lazy_regex!(java_home_re, r#"(?i)^\s*(?:set\s+)?JAVA_HOME\s*=\s*(\S+)"#);
 
 /// 读取并解析 package.json；读失败或非法 JSON 返回 None。
 fn read_pkg_json(path: &Path) -> Option<serde_json::Value> {
@@ -692,8 +830,7 @@ fn extract_port_key_value(content: &str) -> Option<String> {
 
 /// 计算 dir 相对 root 的展示路径。
 ///
-/// 能正常求相对路径则返回之（用 `/` 连接，跨平台一致）；若 dir 即为 root 或
-/// 求相对路径失败（跨盘符等），退化为 dir 的文件名。
+/// dir == root 时返回目录名（如「审查Agent」）作为展示，而非空串。
 fn relpath(root: &Path, dir: &Path) -> String {
     match dir.strip_prefix(root) {
         Ok(rel) => {
@@ -712,6 +849,18 @@ fn relpath(root: &Path, dir: &Path) -> String {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| dir.to_string_lossy().to_string()),
+    }
+}
+
+/// 计算 dir 相对 root 的命令路径（用于 mvn -f / java -jar 等命令拼接）。
+///
+/// 与 [`relpath`] 区别：dir == root 时返回**空串**，调用方据此判断「模块即扫描根」，
+/// 此时 cwd 已在根目录，不应拼 `<mod_rel>/pom.xml`（会变成 `审查Agent/审查Agent/pom.xml`），
+/// 也不该把含中文/空格的目录名作为 -f 参数（经 cmd.exe 传递易乱码）。
+fn relpath_cmd(root: &Path, dir: &Path) -> String {
+    match dir.strip_prefix(root) {
+        Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+        Err(_) => String::new(),
     }
 }
 
@@ -1161,8 +1310,13 @@ public class Helper {
 
     #[test]
     fn spring_boot_pom_produces_three_schemes() {
-        let schemes =
-            DetectService::build_maven_schemes(true, &Some("app.jar".to_string()), "D:/code/repo", "svc");
+        let schemes = DetectService::build_maven_schemes(
+            true,
+            &Some("app.jar".to_string()),
+            "D:/code/repo",
+            "svc",
+            None,
+        );
         assert_eq!(schemes.len(), 3);
         // [0] 开发模式（默认）— -f 定位模块 + workingDirectory 让 fork JVM 在根目录运行
         assert!(schemes[0].recommended);
@@ -1194,12 +1348,152 @@ public class Helper {
 
     #[test]
     fn plain_jar_pom_produces_one_scheme() {
-        let schemes = DetectService::build_maven_schemes(false, &None, "D:/code/repo", "cli");
+        let schemes = DetectService::build_maven_schemes(
+            false,
+            &None,
+            "D:/code/repo",
+            "cli",
+            None,
+        );
         assert_eq!(schemes.len(), 1);
         assert!(schemes[0].recommended);
         // jar 路径含模块相对路径
         assert!(schemes[0].start_cmd.contains("java -jar cli/target/"));
         assert!(schemes[0].build_cmd.is_some());
+    }
+
+    #[test]
+    fn spring_boot_scheme_when_module_is_root() {
+        // 模块即扫描根（mod_rel 空，如「审查Agent」根目录自带 pom.xml）
+        // -f 应退化为 -f pom.xml（cwd 已在根），不拼目录名（避免中文乱码 + 路径错）
+        let schemes = DetectService::build_maven_schemes(
+            true,
+            &Some("app.jar".to_string()),
+            "D:/code/repo",
+            "",
+            None,
+        );
+        assert_eq!(schemes.len(), 3);
+        // [0] 开发模式：-f pom.xml（不带子目录前缀）
+        assert!(schemes[0]
+            .start_cmd
+            .contains("mvn -f pom.xml spring-boot:run"));
+        assert!(!schemes[0].start_cmd.contains("-f .*/pom.xml"));
+        // [1] 内嵌运行：同样 -f pom.xml
+        assert!(schemes[1]
+            .start_cmd
+            .contains("mvn -f pom.xml spring-boot:run -Dspring-boot.run.fork=false"));
+        // [2] 打包运行：jar 路径前缀 target/（无子目录）
+        assert!(schemes[2].start_cmd.contains("java -jar target/app.jar"));
+    }
+
+    #[test]
+    fn spring_boot_scheme_injects_java_home() {
+        // 有 JAVA_HOME 时：mvn 命令前加 set "JAVA_HOME=..." &&；java 用全路径
+        let schemes = DetectService::build_maven_schemes(
+            true,
+            &Some("app.jar".to_string()),
+            "D:/code/repo",
+            "",
+            Some("C:\\JAVA\\jdk-21.0.11"),
+        );
+        // 开发模式：mvn 前缀 set JAVA_HOME
+        assert!(schemes[0]
+            .start_cmd
+            .contains("set \"JAVA_HOME=C:\\JAVA\\jdk-21.0.11\" && mvn"));
+        // 打包运行：java 用全路径
+        assert!(schemes[2]
+            .start_cmd
+            .contains("\"C:\\JAVA\\jdk-21.0.11\\bin\\java.exe\" -jar target/app.jar"));
+        // 构建命令也带 JAVA_HOME
+        assert!(schemes[2]
+            .build_cmd
+            .as_ref()
+            .unwrap()
+            .contains("set \"JAVA_HOME=C:\\JAVA\\jdk-21.0.11\" && mvn clean package"));
+    }
+
+    #[tokio::test]
+    async fn scan_extracts_java_home_from_start_bat() {
+        // 扫描根有 start.bat 声明 JAVA_HOME，应提取并注入到命令
+        // 模拟「审查Agent」场景：root 下 pom.xml + start.bat(含 JAVA_HOME)
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+
+        write(
+            &root.join("pom.xml"),
+            r#"<project>
+  <parent><groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.3.4</version></parent>
+  <artifactId>review-agent</artifactId>
+  <version>1.0.0</version>
+</project>"#,
+        );
+        write_springboot_main(root, "com/review", "ReviewAgentApplication");
+        write(
+            &root.join("src/main/resources/application.yml"),
+            "server:\n  port: 8388\n",
+        );
+        // start.bat 声明 JAVA_HOME（多 JDK 项目）
+        write(
+            &root.join("start.bat"),
+            "@echo off\nset JAVA_HOME=C:\\JAVA\\jdk-21.0.11\n\"%JAVA_HOME%\\bin\\java.exe\" -jar target\\review-agent-1.0.0.jar\n",
+        );
+
+        let detected = DetectService::scan(&root.to_string_lossy()).await.unwrap();
+        assert_eq!(detected.len(), 1);
+        // 打包运行方案应使用全路径 java（Java 21）
+        let pkg = detected[0]
+            .schemes
+            .iter()
+            .find(|s| s.label.contains("打包运行"))
+            .expect("应有打包运行方案");
+        assert!(pkg
+            .start_cmd
+            .contains("\"C:\\JAVA\\jdk-21.0.11\\bin\\java.exe\""));
+        assert!(pkg.start_cmd.contains("target/review-agent-1.0.0.jar"));
+        // 构建命令也应注入 JAVA_HOME
+        assert!(pkg
+            .build_cmd
+            .as_ref()
+            .unwrap()
+            .contains("set \"JAVA_HOME=C:\\JAVA\\jdk-21.0.11\""));
+    }
+
+    #[tokio::test]
+    async fn scan_springboot_at_scan_root_uses_pom_xml() {
+        // 扫描根目录本身就是启动模块（pom.xml 在根）
+        // 模拟「审查Agent」场景：root 下直接有 pom.xml + main + application.yml
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+
+        write(
+            &root.join("pom.xml"),
+            r#"<project>
+  <parent><groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.3.4</version></parent>
+  <artifactId>review-agent</artifactId>
+</project>"#,
+        );
+        write_springboot_main(root, "com/review", "ReviewAgentApplication");
+        write(
+            &root.join("src/main/resources/application.yml"),
+            "server:\n  port: 8388\n",
+        );
+
+        let detected = DetectService::scan(&root.to_string_lossy()).await.unwrap();
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0].name, "review-agent");
+        // 命令应使用 -f pom.xml（模块即根），不应包含目录名前缀
+        let dev_cmd = &detected[0].schemes[0].start_cmd;
+        assert!(
+            dev_cmd.contains("-f pom.xml "),
+            "expected -f pom.xml in {dev_cmd}"
+        );
+        // 展示用 rel_path 仍是目录名（非空），但命令里不能拼它
+        assert!(!dev_cmd.contains("-f review-agent/"));
     }
 
     #[tokio::test]
@@ -1704,5 +1998,71 @@ public class Main {
         let detected = DetectService::scan(&root.to_string_lossy()).await.unwrap();
         assert_eq!(detected.len(), 1);
         assert_eq!(detected[0].expected_ports, vec!["3000".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn scan_source_port_env_fallback_quoted() {
+        // 端口写法带引号：process.env.PORT || '3000'（config.js 里 parseInt 包裹）
+        // 模拟「AI代理」server 真实场景：端口在 src/config.js，index.js 引用 config.port
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            &root.join("server/package.json"),
+            r#"{"name":"proxy-server","scripts":{"start":"node src/index.js"}}"#,
+        );
+        // config.js 定义端口（带引号字符串）
+        write(
+            &root.join("server/src/config.js"),
+            "export default { port: parseInt(process.env.PORT || '3000') };\n",
+        );
+        // index.js 引用变量（无法静态推断，靠扫 config.js 兜底）
+        write(
+            &root.join("server/src/index.js"),
+            "import config from './config.js'\nawait fastify.listen({ port: config.port })\n",
+        );
+
+        let detected = DetectService::scan(&root.to_string_lossy()).await.unwrap();
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0].expected_ports, vec!["3000".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn scan_coordination_script_root_excluded() {
+        // 协调脚本根：多个脚本都以 cd <子目录> && 开头，根不入结果，继续下钻找子项目
+        // 模拟「AI代理」真实场景：根 dev/web 都是 cd 转发
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+
+        // 根协调脚本（dev 和 web 都 cd 到子目录）
+        write(
+            &root.join("package.json"),
+            r#"{"name":"claude-deepseek-proxy","scripts":{"dev":"cd server && node --watch src/index.js","web":"cd web && npm run dev","install:all":"cd server && npm install && cd ../web && npm install"}}"#,
+        );
+        // server 后端
+        write(
+            &root.join("server/package.json"),
+            r#"{"name":"proxy-server","scripts":{"start":"node src/index.js"}}"#,
+        );
+        write(
+            &root.join("server/src/config.js"),
+            "export default { port: parseInt(process.env.PORT || '3000') };\n",
+        );
+        // web 前端
+        write(
+            &root.join("web/package.json"),
+            r#"{"name":"proxy-web","scripts":{"dev":"vite"},"devDependencies":{"vite":"^5.0.0"}}"#,
+        );
+
+        let detected = DetectService::scan(&root.to_string_lossy()).await.unwrap();
+        // 2 个项目：server + web（根协调脚本不入结果）
+        assert_eq!(detected.len(), 2);
+        let names: Vec<&str> = detected.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"proxy-server"));
+        assert!(names.contains(&"proxy-web"));
+        // 根协调脚本不入结果
+        assert!(!names.contains(&"claude-deepseek-proxy"));
+        // server 端口应从 config.js 兜底扫到
+        let server = detected.iter().find(|d| d.name == "proxy-server").unwrap();
+        assert_eq!(server.expected_ports, vec!["3000".to_string()]);
     }
 }
