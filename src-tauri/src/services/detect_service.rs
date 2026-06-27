@@ -364,7 +364,8 @@ impl DetectService {
             return Ok(Some(MavenProbe::Library));
         }
         // 没有可识别端口 → 无法健康检查，不算启动模块
-        let expected_ports = Self::read_java_port(dir);
+        // pom 传入：本地无 resources 时兜底扫 pom <resource><directory> 引用的兄弟模块配置
+        let expected_ports = Self::read_java_port(dir, &stripped);
         if expected_ports.is_empty() {
             return Ok(Some(MavenProbe::Library));
         }
@@ -394,6 +395,22 @@ impl DetectService {
         // 命令用相对路径（dir==root 时为空串，避免 -f 审查Agent/pom.xml 误拼 + 中文乱码）
         let cmd_rel = relpath_cmd(root, dir);
         let root_str = root.to_string_lossy().to_string();
+        // 父聚合器 pom（多模块 reactor）：有则开发模式走 -pl <module> -am 跨模块构建依赖
+        // 注意用原始 content（含 <parent>），stripped 已删 parent 块
+        let aggregator = find_aggregator_pom(dir, &content);
+        let aggregator_rel = aggregator
+            .as_ref()
+            .and_then(|p| {
+                let rel = relpath_cmd(root, p);
+                if rel.is_empty() { None } else { Some(rel) }
+            });
+        // 模块目录名（用于 mvn -pl）：dir==root 时为空串（无聚合器场景不用）
+        let module_name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // spring-boot ZIP layout：打包运行需 -Dloader.path=./lib
+        let zip_layout = is_zip_layout(&stripped);
 
         let schemes = Self::build_maven_schemes(
             is_spring_boot,
@@ -401,6 +418,9 @@ impl DetectService {
             &root_str,
             &cmd_rel,
             java_home.as_deref(),
+            aggregator_rel.as_deref(),
+            &module_name,
+            zip_layout,
         );
 
         Ok(Some(MavenProbe::Project(DetectedProject {
@@ -508,48 +528,25 @@ impl DetectService {
     ///
     /// 覆盖：`application.properties` / `application.yml` / `application.yaml`
     /// 及 `application-{profile}.properties/.yml/.yaml`。
-    fn read_java_port(dir: &Path) -> Vec<String> {
-        let res = dir.join("src/main/resources");
-        let entries = match std::fs::read_dir(&res) {
-            Ok(e) => e,
-            Err(_) => return Vec::new(),
-        };
+    ///
+    /// `pom` 为已脱注释/删 parent 的 pom 文本：当模块本地无 `src/main/resources`
+    /// 时（如 hmsoft-boot-jar 把配置放在兄弟模块、经 pom `<resource><directory>`
+    /// 引入），兜底扫 pom 声明的资源目录，避免误判为无端口的类库。
+    fn read_java_port(dir: &Path, pom: &str) -> Vec<String> {
+        // 1. 本地 src/main/resources
+        let local = dir.join("src/main/resources");
+        let mut ports = scan_application_ports(&local);
 
-        // 先默认配置，再 profile 配置；按文件名排序保证多次扫描结果稳定
-        let mut files: Vec<PathBuf> = Vec::new();
-        for entry in entries.flatten() {
-            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("application") {
-                files.push(entry.path());
-            }
-        }
-        files.sort_by(|a, b| {
-            a.file_name()
-                .unwrap_or_default()
-                .cmp(b.file_name().unwrap_or_default())
-        });
-
-        let mut ports: Vec<String> = Vec::new();
-        for path in files {
-            let content = match std::fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let is_properties = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map_or(false, |e| e.eq_ignore_ascii_case("properties"));
-            let port = if is_properties {
-                parse_properties_port(&content)
-            } else {
-                parse_yml_port(&content)
-            };
-            if let Some(p) = port {
-                if !p.is_empty() && !ports.contains(&p) {
-                    ports.push(p);
+        // 2. 本地无端口 → 兜底扫 pom <resource><directory> 引用的兄弟模块配置
+        if ports.is_empty() {
+            for res_dir in extract_pom_resource_dirs(pom, dir) {
+                if res_dir == local {
+                    continue;
+                }
+                let extra = scan_application_ports(&res_dir);
+                if !extra.is_empty() {
+                    ports = extra;
+                    break;
                 }
             }
         }
@@ -563,18 +560,25 @@ impl DetectService {
     /// - `root`：扫描根目录（= workdir，License 等运行时资源在此）
     /// - `mod_rel`：模块相对根目录的**命令路径**（如 "backend/hr"）；模块即扫描根时为空串
     /// - `java_home`：从启动脚本提取的 JAVA_HOME（多 JDK 项目用）；None 则用系统 PATH
+    /// - `aggregator_rel`：父聚合器 pom 相对 root 的路径（多模块 reactor）；None 表示无聚合器
+    /// - `module_name`：模块目录名（用于 mvn `-pl`，仅在聚合器场景生效）
+    /// - `zip_layout`：spring-boot 是否 ZIP layout（打包运行需 `-Dloader.path=./lib`）
     ///
     /// 运行目录策略（spawn current_dir 按类型区分，见 spawn.rs）：
-    /// - Java 类：current_dir = workdir（root），mvn 用 `-f <mod_rel>/pom.xml` 定位启动模块
-    ///   （mod_rel 为空时用 `-f pom.xml`）；fork=false 时 user.dir=root 自动找到 License；
-    ///   fork=true 时 workingDirectory 参数生效
-    /// - 打包运行：current_dir = workdir（root），jar 在模块 target/ 下，用 mod_rel 指向
+    /// - Java 类：current_dir = workdir（root），mvn 用 `-f` 定位 pom
+    ///   （有聚合器时 `-f <聚合器> -pl <模块> -am` 跨 reactor 构建依赖；否则 `-f <mod_rel>/pom.xml`）
+    /// - 打包运行：current_dir = workdir（root）；ZIP layout 时用 `cd <mod_rel> &&` 切到模块目录，
+    ///   让 `-Dloader.path=./lib` 与 `target/<jar>` 相对模块目录定位
+    #[allow(clippy::too_many_arguments)]
     fn build_maven_schemes(
         is_spring_boot: bool,
         jar_name: &Option<String>,
         root: &str,
         mod_rel: &str,
         java_home: Option<&str>,
+        aggregator_rel: Option<&str>,
+        module_name: &str,
+        zip_layout: bool,
     ) -> Vec<LaunchScheme> {
         // 有 JAVA_HOME 时：mvn 前加 `set "JAVA_HOME=..." && `（让 Maven 用对的 JDK 运行插件）；
         // java 用全路径（最可靠，不依赖 PATH）。
@@ -586,66 +590,143 @@ impl DetectService {
             Some(jh) => format!("\"{jh}\\bin\\java.exe\""),
             None => "java".to_string(),
         };
-        let package_build = Some(format!("{mvn_prefix}mvn clean package -DskipTests"));
 
-        // 打包运行时 current_dir=root，jar 在模块 target/ 下，需用相对路径从 root 指向。
-        // mod_rel 用 '/' 分隔（relpath 保证），Windows cmd 也接受 '/' 指向子目录。
-        let jar_rel_prefix = if mod_rel.is_empty() {
-            "target/".to_string()
+        // mvn 用 -f 定位 pom：spawn cwd=workdir(root)。
+        // mvn -f 定位 pom 的参数。分两类用途：
+        // - f_param（含 -am）：install / package 等构建阶段，需 reactor 先构建兄弟模块依赖。
+        // - run_param（不含 -am）：spring-boot:run 只在启动模块跑（-am 会让 CLI goal 误跑到
+        //   无 mainClass 的根聚合器报错 "Unable to find a suitable main class"）。
+        //
+        // 有聚合器：-f <聚合器> -pl <模块>；构建阶段再加 -am。聚合器路径含空格/中文时加引号。
+        // 无聚合器：
+        //   - 模块在子目录（mod_rel 非空）：-f <mod_rel>/pom.xml（含空格加引号）
+        //   - 模块即扫描根（mod_rel 空）：-f pom.xml（cwd 已在根，避免中文目录名经 cmd.exe 乱码）
+        let (f_param, run_param) = if let Some(agg) = aggregator_rel {
+            if !module_name.is_empty() {
+                let agg_quoted = if agg.contains(' ') {
+                    format!("\"{agg}\"")
+                } else {
+                    agg.to_string()
+                };
+                let base = format!("-f {agg_quoted} -pl {module_name} ");
+                // 构建阶段多带 -am（also-make：构建依赖的兄弟模块）
+                (format!("{base}-am "), base)
+            } else {
+                // module_name 为空（理论上聚合器场景下不会），退回普通 -f
+                ("-f pom.xml ".to_string(), "-f pom.xml ".to_string())
+            }
+        } else if mod_rel.is_empty() {
+            ("-f pom.xml ".to_string(), "-f pom.xml ".to_string())
         } else {
-            format!("{mod_rel}/target/")
-        };
-        let jar_start = match jar_name {
-            Some(j) => format!("{java_bin} -jar {jar_rel_prefix}{j}"),
-            None => format!("{java_bin} -jar {jar_rel_prefix}app.jar"),
+            let p = if mod_rel.contains(' ') {
+                format!("-f \"{mod_rel}/pom.xml\" ")
+            } else {
+                format!("-f {mod_rel}/pom.xml ")
+            };
+            (p.clone(), p)
         };
 
-        // mvn 用 -f 定位启动模块 pom：spawn cwd=workdir(root)。
-        // - 模块在子目录（mod_rel 非空）：-f <mod_rel>/pom.xml
-        // - 模块即扫描根（mod_rel 空，如「审查Agent」根目录自带 pom）：-f pom.xml
-        //   （cwd 已在根，不能再拼目录名；且避免中文目录名作为 -f 参数经 cmd.exe 乱码）
-        let f_param = if mod_rel.is_empty() {
-            "-f pom.xml ".to_string()
+        // 打包构建：复用 f_param（有聚合器时同样走 -pl <module> -am，让 reactor 先构建兄弟模块）
+        let package_build = Some(format!("{mvn_prefix}mvn {f_param}clean package -DskipTests"));
+
+        // 打包运行命令。
+        // - 普通 jar：cwd=root，jar 在 <mod_rel>/target/ 下，路径从 root 相对指向；含空格加引号
+        // - ZIP layout（spring-boot PropertiesLauncher）：须 `-Dloader.path=./lib` 从 lib/ 加载
+        //   外挂依赖。loader.path 与 jar 路径都相对 cwd，而 lib/、target/ 在模块目录下 →
+        //   用 `cd <mod_rel> &&` 切到模块目录（含空格加引号），jar 路径退化为 target/<jar>。
+        //   （模块即扫描根时 mod_rel 空，cwd 已在根，cd 省略）
+        let jar_name_str = jar_name.clone().unwrap_or_else(|| "app.jar".to_string());
+        let jar_start = if zip_layout {
+            // cd 到模块目录（非空时），lib/ 与 target/<jar> 相对它定位
+            let cd = if mod_rel.is_empty() {
+                String::new()
+            } else if mod_rel.contains(' ') {
+                format!("cd \"{mod_rel}\" && ")
+            } else {
+                format!("cd {mod_rel} && ")
+            };
+            format!("{cd}{java_bin} -Dloader.path=./lib -jar target/{jar_name_str}")
         } else {
-            format!("-f {mod_rel}/pom.xml ")
+            // 普通 jar：路径从 root 相对指向模块 target/；含空格整体加引号
+            let jar_rel_prefix = if mod_rel.is_empty() {
+                "target/".to_string()
+            } else {
+                format!("{mod_rel}/target/")
+            };
+            let quoted = jar_rel_prefix.contains(' ');
+            if quoted {
+                format!("{java_bin} -jar \"{jar_rel_prefix}{jar_name_str}\"")
+            } else {
+                format!("{java_bin} -jar {jar_rel_prefix}{jar_name_str}")
+            }
         };
 
         if is_spring_boot {
             let wd_param = format!("-Dspring-boot.run.workingDirectory=\"{root}\"");
-            let desc = match jar_name {
-                Some(_) => "先构建 jar 再运行，模拟生产形态",
-                None => "先构建 jar 再运行；jar 名未能自动识别，请按实际产物修正",
+            // 多模块 reactor（有聚合器）：spring-boot:run 单独跑会因兄弟模块未 install 编译失败。
+            // 解法：start_cmd 先 install -pl <module> -am（构建阶段，Maven 增量，源码没变秒过），
+            // 再 spring-boot:run -pl <module>（不带 -am，避免 goal 误跑到无 mainClass 的根聚合器）。
+            // 无聚合器：单段 spring-boot:run（单模块项目，兄弟依赖已在本地仓库或无兄弟依赖）。
+            let has_agg = aggregator_rel.is_some();
+            // install 前缀：复用 mvn_prefix（JAVA_HOME）；构建阶段用 f_param（含 -am）
+            let install_seg = if has_agg {
+                format!("{mvn_prefix}mvn {f_param}install -DskipTests && ")
+            } else {
+                String::new()
+            };
+            let dev_desc = if has_agg {
+                "多模块项目：先 install 兄弟模块（Maven 增量编译，源码没变时秒级跳过）\
+                    再运行本模块。改了兄弟模块代码自动重编译重装；改启动模块代码重跑即可。"
+            } else {
+                "Maven fork 子进程运行，workingDirectory 设为项目根目录；\
+                    改代码重跑即可，日常开发最快。依赖多/路径长时若报 error=206 请用内嵌运行"
+            };
+            let embed_desc = if has_agg {
+                "多模块项目：先 install 兄弟模块（增量）再内嵌运行（fork=false 规避 Windows \
+                    classpath 超长 error=206）；运行时工作目录=扫描根，License 等资源须在扫描根目录"
+            } else {
+                "不 fork 子进程，在 Maven 同进程内运行，规避 Windows \
+                    classpath 超长（CreateProcess error=206）问题；运行时工作目录=扫描根，\
+                    License 等资源须放在扫描根目录"
+            };
+            let zip_note = if zip_layout {
+                "（spring-boot ZIP layout：已加 -Dloader.path=./lib 从 lib/ 加载外挂依赖）"
+            } else {
+                ""
+            };
+            let jar_desc = match jar_name {
+                Some(_) => format!("先构建 jar 再运行，模拟生产形态{zip_note}"),
+                None => format!(
+                    "先构建 jar 再运行；jar 名未能自动识别，请按实际产物修正{zip_note}"
+                ),
             };
             vec![
                 LaunchScheme {
                     label: "开发模式".to_string(),
-                    recommended: true,
-                    start_cmd: format!("{mvn_prefix}mvn {f_param}spring-boot:run {wd_param}"),
+                    // 有聚合器：install -pl -am && run -pl（run 不带 -am，goal 只在启动模块跑）
+                    recommended: !has_agg,
+                    start_cmd: format!(
+                        "{install_seg}{mvn_prefix}mvn {run_param}spring-boot:run {wd_param}"
+                    ),
                     build_cmd: None,
-                    description: "Maven fork 子进程运行，workingDirectory 设为项目根目录；\
-                        改代码重跑即可，日常开发最快。依赖多/路径长时若报 error=206 请用内嵌运行"
-                        .to_string(),
+                    description: dev_desc.to_string(),
                 },
                 LaunchScheme {
                     label: "开发模式（内嵌运行）".to_string(),
                     recommended: false,
-                    // fork=false 时 workingDirectory 参数被 Maven 忽略（仅 fork 模式生效），
-                    // 故不写它；user.dir 由 spawn cwd（=workdir root）决定，License 在 root 能找到。
                     start_cmd: format!(
-                        "{mvn_prefix}mvn {f_param}spring-boot:run -Dspring-boot.run.fork=false"
+                        "{install_seg}{mvn_prefix}mvn {run_param}spring-boot:run -Dspring-boot.run.fork=false"
                     ),
                     build_cmd: None,
-                    description: "不 fork 子进程，在 Maven 同进程内运行，规避 Windows \
-                        classpath 超长（CreateProcess error=206）问题；运行时工作目录=扫描根，\
-                        License 等资源须放在扫描根目录"
-                        .to_string(),
+                    description: embed_desc.to_string(),
                 },
                 LaunchScheme {
                     label: "打包运行模式".to_string(),
-                    recommended: false,
+                    // 有聚合器的多模块项目：打包 jar 已构建立即可跑，设为推荐
+                    recommended: has_agg,
                     start_cmd: jar_start,
                     build_cmd: package_build,
-                    description: desc.to_string(),
+                    description: jar_desc,
                 },
             ]
         } else {
@@ -680,6 +761,9 @@ macro_rules! lazy_regex {
 
 lazy_regex!(fallback_port_re, r"\|\|\s*(\d{2,5})\b");
 lazy_regex!(port_key_value_re, r"(?m)\bport\s*:\s*(\d{2,5})\b");
+// const/let/var port = <数字>（vue.config.js 常见：const port = 8199）
+// 等号右边要求紧跟数字，故 `const port = process.env.port || 8199` 不会误命中
+lazy_regex!(port_assign_re, r"(?i)(?:const|let|var)\s+port\s*=\s*(\d{2,5})\b");
 lazy_regex!(main_re, r"public\s+static\s+void\s+main\s*\(\s*String\s*\[\s*\]\s*\w+\s*\)");
 lazy_regex!(java_comment_re, r"//[^\n]*|/\*[\s\S]*?\*/");
 // Node 后端源码端口：process.env.PORT || 3001 / '3001' / "3001"（兼容带引号字符串写法）
@@ -709,9 +793,14 @@ fn read_port_from_vue_config(dir: &Path) -> Option<String> {
     extract_port_from_config(&content)
 }
 
-/// 从 JS/TS 配置文件文本中提取端口。优先 `|| <port>` 兜底写法，次选 `port: <数字>` 键值。
+/// 从 JS/TS 配置文件文本中提取端口。三级兜底：
+/// 1. `|| <port>` 链（取最后一个兜底值）
+/// 2. `port: <数字>` 键值
+/// 3. `const/let/var port = <数字>` 常量赋值（如 vue.config.js 的 `const port = 8199`）
 fn extract_port_from_config(content: &str) -> Option<String> {
-    extract_fallback_port_after_or(content).or_else(|| extract_port_key_value(content))
+    extract_fallback_port_after_or(content)
+        .or_else(|| extract_port_key_value(content))
+        .or_else(|| extract_port_const_assignment(content))
 }
 
 /// 从 vite.config.[js|ts|mjs] 提取 server.port。
@@ -824,6 +913,17 @@ fn extract_fallback_port_after_or(content: &str) -> Option<String> {
 /// 例：`port: 8188` / `port: 8080,` / `port: 5174 }`
 fn extract_port_key_value(content: &str) -> Option<String> {
     port_key_value_re()
+        .captures(content)
+        .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
+}
+
+/// 提取 `const/let/var port = <数字>` 常量赋值写法中的端口。
+///
+/// 例：`const port = 8199` / `const PORT = 8199`（变量随后被 `port: port` 引用，
+/// 这种引用写法键值正则匹配不到，需直接取赋值处的数字）。
+/// 取首个命中（一个配置文件只声明一次端口变量）。
+fn extract_port_const_assignment(content: &str) -> Option<String> {
+    port_assign_re()
         .captures(content)
         .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
 }
@@ -980,6 +1080,70 @@ fn scan_target_jar(dir: &Path) -> Option<String> {
     jars.into_iter().next()
 }
 
+/// 检测模块所属的父聚合器 pom（reactor 根）。
+///
+/// 多模块项目里，启动模块（如 hmsoft-boot-jar）的源码引用兄弟模块（hmsoft-boot）的类，
+/// 单跑 `mvn -f <module>/pom.xml` 会因兄弟模块未 install 到本地仓库而编译失败。此时需让
+/// mvn 指向**聚合器 pom** + `-pl <module> -am`，让 Maven 在 reactor 内构建依赖模块。
+///
+/// 判定（避免误命中碰巧在上级目录的 pom）：
+/// 1. 模块 pom 声明了 `<parent>`（有父）
+/// 2. `module_dir/../pom.xml` 存在
+/// 3. 该 pom 是聚合器（`<packaging>pom</packaging>`）
+/// 4. 该 pom 的 `<modules>` 列出本模块目录名 —— 确认是真正的 reactor 父
+///
+/// 命中返回聚合器 pom 的绝对路径；任一条件不满足返回 None。
+fn find_aggregator_pom(module_dir: &Path, pom_content: &str) -> Option<PathBuf> {
+    // 1. 必须有 <parent>（无 parent 的根 pom 不适用此机制）
+    if !pom_content.contains("<parent>") {
+        return None;
+    }
+    // 2. 上级目录的 pom.xml
+    let parent_pom = module_dir.parent()?.join("pom.xml");
+    if !parent_pom.is_file() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&parent_pom).ok()?;
+    let stripped = strip_pom(&content);
+    // 3. 必须是聚合器（packaging=pom）
+    if !is_pom_aggregator(&stripped) {
+        return None;
+    }
+    // 4. <modules> 须列出本模块目录名
+    let module_name = module_dir.file_name()?.to_string_lossy().into_owned();
+    if !aggregator_includes_module(&stripped, &module_name) {
+        return None;
+    }
+    Some(parent_pom)
+}
+
+/// 判断聚合器 pom 的 `<modules>` 是否列出指定模块名。
+///
+/// 匹配 `<module>name</module>`（name 前后容空格）。不区分 `modules` 块内是否有其他内容。
+fn aggregator_includes_module(stripped_aggregator: &str, module_name: &str) -> bool {
+    let Some(block) = extract_first_tag(stripped_aggregator, "modules") else {
+        return false;
+    };
+    let mut found = false;
+    for_each_child_tag(&block, "module", |m| {
+        if m.trim() == module_name {
+            found = true;
+        }
+    });
+    found
+}
+
+/// 检测 pom 是否声明 spring-boot 打包插件 `<layout>ZIP</layout>`。
+///
+/// ZIP layout 的 jar 由 PropertiesLauncher 加载，须配合 `-Dloader.path=./lib`
+/// 从外部 lib/ 目录加载依赖（非内嵌 fat-jar）。
+fn is_zip_layout(stripped_pom: &str) -> bool {
+    if let Some(layout) = extract_first_tag(stripped_pom, "layout") {
+        return layout.trim().eq_ignore_ascii_case("ZIP");
+    }
+    false
+}
+
 /// 取 XML 中首个 <tag>...</tag> 文本（不处理嵌套同名标签）。
 fn extract_first_tag(s: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
@@ -988,6 +1152,22 @@ fn extract_first_tag(s: &str, tag: &str) -> Option<String> {
     let rest = &s[start + open.len()..];
     let end = rest.find(&close)?;
     Some(rest[..end].trim().to_string())
+}
+
+/// 在 XML 块内逐个提取 `<tag>...</tag>` 文本，对每个命中调用 `f`。
+///
+/// 与 [`extract_first_tag`] 组合：先用它取外层块（如 `<modules>`），再用本函数
+/// 遍历块内子标签（如 `<module>`）。不处理嵌套同名标签（此模块所有 pom 标签均为扁平结构）。
+fn for_each_child_tag(block: &str, tag: &str, mut f: impl FnMut(&str)) {
+    let close_tag = format!("</{tag}>");
+    let mut rest = block;
+    while let Some(content) = extract_first_tag(rest, tag) {
+        f(&content);
+        match rest.find(&close_tag) {
+            Some(pos) => rest = &rest[pos + close_tag.len()..],
+            None => break,
+        }
+    }
 }
 
 /// 删除 XML 中首个 <tag>...</tag> 块（含内容），返回新字符串。
@@ -1006,6 +1186,82 @@ fn remove_tag_block(s: &str, tag: &str) -> String {
     out.push_str(&s[..start]);
     out.push_str(&s[end..]);
     out
+}
+
+/// 扫描某个目录下所有 `application*` 配置文件，返回发现的全部端口（去重）。
+///
+/// 默认配置在前、profile 配置在后，按文件名排序保证多次扫描结果稳定。
+/// properties 走 [`parse_properties_port`]，yml/yaml 走 [`parse_yml_port`]。
+/// 目录不存在或无配置文件返回空 Vec。
+fn scan_application_ports(res_dir: &Path) -> Vec<String> {
+    let entries = match std::fs::read_dir(res_dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    // 先默认配置，再 profile 配置；按文件名排序保证多次扫描结果稳定
+    let mut files: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with("application") {
+            files.push(entry.path());
+        }
+    }
+    files.sort_by(|a, b| {
+        a.file_name()
+            .unwrap_or_default()
+            .cmp(b.file_name().unwrap_or_default())
+    });
+
+    let mut ports: Vec<String> = Vec::new();
+    for path in files {
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let is_properties = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map_or(false, |e| e.eq_ignore_ascii_case("properties"));
+        let port = if is_properties {
+            parse_properties_port(&content)
+        } else {
+            parse_yml_port(&content)
+        };
+        if let Some(p) = port {
+            if !p.is_empty() && !ports.contains(&p) {
+                ports.push(p);
+            }
+        }
+    }
+    ports
+}
+
+/// 从已预处理的 pom 中提取 `<build><resources>` 里所有 `<directory>` 路径，
+/// 按模块目录解析为绝对路径。
+///
+/// 适用于启动模块自身无 `src/main/resources`、把配置放在兄弟模块、经 pom
+/// `<resource><directory>../hmsoft-boot/src/main/resources</directory>` 引入的场景。
+/// 用字符串方式定位首个 `<resources>...</resources>` 块（与现有 pom 解析风格一致，
+/// 不引入重型 XML 库）；块内取所有 `<directory>` 文本，相对模块目录解析。
+/// 路径不存在或无法解析的条目自动跳过。
+fn extract_pom_resource_dirs(pom: &str, module_dir: &Path) -> Vec<PathBuf> {
+    let Some(block) = extract_first_tag(pom, "resources") else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for_each_child_tag(&block, "directory", |d| {
+        let d = d.trim();
+        if !d.is_empty() {
+            let resolved = module_dir.join(d);
+            if resolved.is_dir() {
+                dirs.push(resolved);
+            }
+        }
+    });
+    dirs
 }
 
 /// 剥离 XML 注释 <!-- ... -->。
@@ -1129,6 +1385,97 @@ mod tests {
     }
 
     #[test]
+    fn zip_layout_detected_from_pom() {
+        let pom = r#"<project>
+  <artifactId>app</artifactId>
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+        <configuration>
+          <layout>ZIP</layout>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>"#;
+        assert!(is_zip_layout(&strip_pom(pom)));
+        // 小写 zip 也应识别
+        let pom_lower = pom.replace("ZIP", "zip");
+        assert!(is_zip_layout(&strip_pom(&pom_lower)));
+    }
+
+    #[test]
+    fn non_zip_layout_not_detected() {
+        let pom = r#"<project>
+  <artifactId>app</artifactId>
+  <build><finalName>app</finalName></build>
+</project>"#;
+        assert!(!is_zip_layout(&strip_pom(pom)));
+    }
+
+    #[tokio::test]
+    async fn find_aggregator_pom_locates_reactor_parent() {
+        // 多模块 reactor：父 pom 是聚合器且列出本模块 → 应找到它
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        // 父聚合器 pom
+        write(
+            &root.join("pom.xml"),
+            r#"<project>
+  <groupId>com.hmsoft</groupId>
+  <artifactId>parent</artifactId>
+  <version>7.1.0</version>
+  <packaging>pom</packaging>
+  <modules>
+    <module>hmsoft-boot</module>
+    <module>hmsoft-boot-jar</module>
+  </modules>
+</project>"#,
+        );
+        // 启动模块 pom（有 parent，自身在 hmsoft-boot-jar/）
+        let module_pom = r#"<project>
+  <artifactId>hmsoft-boot-jar</artifactId>
+  <packaging>jar</packaging>
+  <parent>
+    <groupId>com.hmsoft</groupId>
+    <artifactId>parent</artifactId>
+    <version>7.1.0</version>
+  </parent>
+</project>"#;
+        write(&root.join("hmsoft-boot-jar/pom.xml"), module_pom);
+        let module_dir = root.join("hmsoft-boot-jar");
+        let found = find_aggregator_pom(&module_dir, module_pom);
+        assert_eq!(
+            found.as_deref(),
+            Some(root.join("pom.xml").as_path())
+        );
+    }
+
+    #[tokio::test]
+    async fn find_aggregator_pom_rejects_parent_not_listing_module() {
+        // 父 pom 是聚合器但 modules 里没有本模块 → 不应误命中
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            &root.join("pom.xml"),
+            r#"<project>
+  <artifactId>parent</artifactId>
+  <packaging>pom</packaging>
+  <modules><module>other-module</module></modules>
+</project>"#,
+        );
+        let module_pom = r#"<project>
+  <artifactId>hmsoft-boot-jar</artifactId>
+  <parent><artifactId>parent</artifactId></parent>
+</project>"#;
+        write(&root.join("hmsoft-boot-jar/pom.xml"), module_pom);
+        let module_dir = root.join("hmsoft-boot-jar");
+        assert!(find_aggregator_pom(&module_dir, module_pom).is_none());
+    }
+
+    #[test]
     fn artifact_id_skips_parent_block() {
         let pom = r#"<project>
   <parent>
@@ -1190,6 +1537,49 @@ mod tests {
         // devServer: { port: 8888 }
         let content = "module.exports = {\n  devServer: {\n    port: 8888,\n    open: true\n  }\n};\n";
         assert_eq!(extract_port_key_value(content).as_deref(), Some("8888"));
+    }
+
+    #[test]
+    fn vue_config_port_from_const_assignment() {
+        // vue.config.js 常见写法：const port = 8199，随后 port: port 引用变量
+        // 键值正则匹配 `port: port`（非数字）会失败，需走常量赋值兜底
+        let content = "const port = 8199\nmodule.exports = { devServer: { port: port } };\n";
+        assert_eq!(extract_port_from_config(content).as_deref(), Some("8199"));
+    }
+
+    #[test]
+    fn vue_config_const_assignment_case_insensitive() {
+        // const PORT = 8199（大写变量名，正则不区分大小写）
+        let content = "const PORT = 8199\n";
+        assert_eq!(extract_port_const_assignment(content).as_deref(), Some("8199"));
+    }
+
+    #[test]
+    fn vue_config_const_port_with_env_fallback_not_mismatched() {
+        // const port = process.env.port || 8199：等号右边非纯数字，常量赋值正则不应命中；
+        // 但 fallback 正则会命中 || 8199，故整体仍应取 8199（验证常量正则不破坏既有逻辑）
+        let content = "const port = process.env.port || 8199\n";
+        assert_eq!(extract_port_const_assignment(content), None);
+        assert_eq!(extract_port_from_config(content).as_deref(), Some("8199"));
+    }
+
+    #[tokio::test]
+    async fn scan_node_vue_cli_const_port() {
+        // vue-cli 项目：vue.config.js 里 `const port = 8199` + `port: port` 引用，
+        // 应提取 8199 而非默认 8080（真实「HanXiInfotech oa vue」场景）
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            &root.join("web/package.json"),
+            r#"{"name":"web","scripts":{"dev":"vue-cli-service serve"},"devDependencies":{"@vue/cli-service":"~5.0.0"}}"#,
+        );
+        write(
+            &root.join("web/vue.config.js"),
+            "const port = 8199\nmodule.exports = { devServer: { port: port } };\n",
+        );
+        let detected = DetectService::scan(&root.to_string_lossy()).await.unwrap();
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0].expected_ports, vec!["8199".to_string()]);
     }
 
     #[test]
@@ -1316,6 +1706,9 @@ public class Helper {
             "D:/code/repo",
             "svc",
             None,
+            None,
+            "svc",
+            false,
         );
         assert_eq!(schemes.len(), 3);
         // [0] 开发模式（默认）— -f 定位模块 + workingDirectory 让 fork JVM 在根目录运行
@@ -1340,10 +1733,92 @@ public class Helper {
         assert!(schemes[2]
             .start_cmd
             .contains("java -jar svc/target/app.jar"));
+        // 构建命令走同样的 -f 定位（无聚合器）
         assert_eq!(
             schemes[2].build_cmd.as_deref(),
-            Some("mvn clean package -DskipTests")
+            Some("mvn -f svc/pom.xml clean package -DskipTests")
         );
+    }
+
+    #[test]
+    fn spring_boot_scheme_quotes_f_param_with_spaces() {
+        // 模块相对路径含空格（无聚合器场景，仅验证引号）：
+        // -f 和 jar 路径必须加引号，否则 cmd.exe 会在空格处截断导致 Maven 报
+        // "POM file HanXiInfotech specified the -f/--file does not exist"
+        let schemes = DetectService::build_maven_schemes(
+            true,
+            &Some("purus.jar".to_string()),
+            "D:/code/repo",
+            "HanXiInfotech OA Sever/hmsoft-boot-jar",
+            None,
+            None,
+            "hmsoft-boot-jar",
+            false,
+        );
+        assert_eq!(schemes.len(), 3);
+        // [0] 开发模式：-f 含空格 → 加引号
+        assert!(schemes[0]
+            .start_cmd
+            .contains("mvn -f \"HanXiInfotech OA Sever/hmsoft-boot-jar/pom.xml\" spring-boot:run"),
+            "expected quoted -f in: {}", schemes[0].start_cmd);
+        // [1] 内嵌运行：同样 -f 加引号
+        assert!(schemes[1]
+            .start_cmd
+            .contains("mvn -f \"HanXiInfotech OA Sever/hmsoft-boot-jar/pom.xml\" spring-boot:run -Dspring-boot.run.fork=false"));
+        // [2] 打包运行：jar 路径含空格 → 加引号
+        assert!(schemes[2]
+            .start_cmd
+            .contains("java -jar \"HanXiInfotech OA Sever/hmsoft-boot-jar/target/purus.jar\""),
+            "expected quoted jar path in: {}", schemes[2].start_cmd);
+    }
+
+    #[test]
+    fn spring_boot_scheme_aggregator_install_then_run() {
+        // 多模块 reactor（真实 hmsoft-boot-jar 场景）：
+        // 有聚合器 pom → 开发模式 = 「install -pl <module> -am && spring-boot:run -pl <module>」。
+        // install 段构建兄弟模块（含 -am）；run 段不带 -am（避免 goal 误跑到无 mainClass 的根聚合器）。
+        // 聚合器路径含空格 → 加引号。
+        let schemes = DetectService::build_maven_schemes(
+            true,
+            &Some("purus.jar".to_string()),
+            "D:/work/hanxiinfotech-oa-for-java-3.0",
+            "HanXiInfotech OA Sever/hmsoft-boot-jar",
+            None,
+            Some("HanXiInfotech OA Sever/pom.xml"),
+            "hmsoft-boot-jar",
+            true, // ZIP layout
+        );
+        let agg = "-f \"HanXiInfotech OA Sever/pom.xml\"";
+        // [0] 开发模式（非推荐，因有聚合器）：install -pl -am && run -pl
+        assert!(!schemes[0].recommended, "有聚合器时打包模式应推荐，开发模式非推荐");
+        let dev = &schemes[0].start_cmd;
+        assert!(
+            dev.contains(&format!("mvn {agg} -pl hmsoft-boot-jar -am install -DskipTests && mvn {agg} -pl hmsoft-boot-jar spring-boot:run")),
+            "expected install -am && run (no -am) in: {dev}"
+        );
+        // run 段不应带 -am（避免误跑到根聚合器）
+        assert!(!dev.contains("spring-boot:run -pl hmsoft-boot-jar -am"));
+        assert!(dev.contains("-Dspring-boot.run.workingDirectory"));
+        // 不应出现指向模块自身 pom 的 -f
+        assert!(!dev.contains("-f \"HanXiInfotech OA Sever/hmsoft-boot-jar/pom.xml\""));
+        // [1] 内嵌运行：同样 install -am && run -pl（fork=false）
+        let embed = &schemes[1].start_cmd;
+        assert!(embed.contains(&format!(
+            "mvn {agg} -pl hmsoft-boot-jar -am install -DskipTests && mvn {agg} -pl hmsoft-boot-jar spring-boot:run -Dspring-boot.run.fork=false"
+        )));
+        // [2] 打包运行（推荐，因有聚合器）：ZIP layout → -Dloader.path=./lib + cd 模块目录
+        assert!(schemes[2].recommended, "有聚合器时打包模式应推荐");
+        let pkg = &schemes[2].start_cmd;
+        assert!(
+            pkg.contains("cd \"HanXiInfotech OA Sever/hmsoft-boot-jar\" && java -Dloader.path=./lib -jar target/purus.jar"),
+            "expected zip-layout loader.path + cd in: {pkg}"
+        );
+        // 打包构建走聚合器 -pl -am（构建阶段需兄弟模块）
+        assert!(schemes[2]
+            .build_cmd
+            .as_ref()
+            .unwrap()
+            .contains(&format!("mvn {agg} -pl hmsoft-boot-jar -am clean package")));
     }
 
     #[test]
@@ -1354,6 +1829,9 @@ public class Helper {
             "D:/code/repo",
             "cli",
             None,
+            None,
+            "cli",
+            false,
         );
         assert_eq!(schemes.len(), 1);
         assert!(schemes[0].recommended);
@@ -1372,6 +1850,9 @@ public class Helper {
             "D:/code/repo",
             "",
             None,
+            None,
+            "repo",
+            false,
         );
         assert_eq!(schemes.len(), 3);
         // [0] 开发模式：-f pom.xml（不带子目录前缀）
@@ -1396,6 +1877,9 @@ public class Helper {
             "D:/code/repo",
             "",
             Some("C:\\JAVA\\jdk-21.0.11"),
+            None,
+            "repo",
+            false,
         );
         // 开发模式：mvn 前缀 set JAVA_HOME
         assert!(schemes[0]
@@ -1405,12 +1889,12 @@ public class Helper {
         assert!(schemes[2]
             .start_cmd
             .contains("\"C:\\JAVA\\jdk-21.0.11\\bin\\java.exe\" -jar target/app.jar"));
-        // 构建命令也带 JAVA_HOME
+        // 构建命令也带 JAVA_HOME（mod_rel 空 → -f pom.xml）
         assert!(schemes[2]
             .build_cmd
             .as_ref()
             .unwrap()
-            .contains("set \"JAVA_HOME=C:\\JAVA\\jdk-21.0.11\" && mvn clean package"));
+            .contains("set \"JAVA_HOME=C:\\JAVA\\jdk-21.0.11\" && mvn -f pom.xml clean package"));
     }
 
     #[tokio::test]
@@ -1812,6 +2296,55 @@ public class Main {
         let detected = DetectService::scan(&root.to_string_lossy()).await.unwrap();
         assert_eq!(detected.len(), 1);
         assert_eq!(detected[0].expected_ports, vec!["8088".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn scan_springboot_port_from_sibling_resource_dir() {
+        // 启动模块自身无 src/main/resources，application.yml 放在兄弟模块、
+        // 经 pom <resource><directory>../hmsoft-boot/src/main/resources</directory> 引入。
+        // 真实「hmsoft-boot-jar」场景：应兜底扫到兄弟模块的端口（8198），而非被判为类库过滤。
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        // 启动模块 hmsoft-boot-jar：有 main，无本地 resources
+        write(
+            &root.join("hmsoft-boot-jar/pom.xml"),
+            r#"<project>
+  <artifactId>hmsoft-boot-jar</artifactId>
+  <packaging>jar</packaging>
+  <parent><groupId>com.hmsoft</groupId>
+    <artifactId>hmsoft-purus-bpm</artifactId>
+    <version>7.1.0</version></parent>
+  <build>
+    <finalName>purus</finalName>
+    <resources>
+      <resource>
+        <directory>src/main/resources</directory>
+      </resource>
+      <resource>
+        <directory>../hmsoft-boot/src/main/resources</directory>
+        <includes>
+          <include>application.yml</include>
+        </includes>
+      </resource>
+    </resources>
+  </build>
+</project>"#,
+        );
+        write_springboot_main(
+            &root.join("hmsoft-boot-jar"),
+            "com/hmsoft",
+            "StartBootApplication",
+        );
+        // 兄弟模块 hmsoft-boot 持有 application.yml（端口 8198）
+        write(
+            &root.join("hmsoft-boot/src/main/resources/application.yml"),
+            "server:\n  port: 8198\n",
+        );
+
+        let detected = DetectService::scan(&root.to_string_lossy()).await.unwrap();
+        assert_eq!(detected.len(), 1, "hmsoft-boot-jar 应被检测到");
+        assert_eq!(detected[0].name, "hmsoft-boot-jar");
+        assert_eq!(detected[0].expected_ports, vec!["8198".to_string()]);
     }
 
     #[tokio::test]
