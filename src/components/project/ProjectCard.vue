@@ -12,7 +12,7 @@ import { computed } from 'vue'
 import { NIcon, NTag } from 'naive-ui'
 import { CubeOutline } from '@vicons/ionicons5'
 import { PROJECT_TYPE_LABELS } from '@/types/project'
-import type { Project } from '@/types/project'
+import type { Project, BuildState } from '@/types/project'
 import type { HealthStatus, ProjectStatus } from '@/types/monitor'
 import StatusBadge from './StatusBadge.vue'
 import MetricsBar from './MetricsBar.vue'
@@ -24,6 +24,8 @@ const props = defineProps<{
   status?: ProjectStatus | null
   /** 是否有进行中的启停操作（禁用按钮） */
   busy?: boolean
+  /** 构建状态（驱动构建按钮状态图标） */
+  buildState?: BuildState
   /** 拖拽进行中（本卡正在被拖动）——半透明视觉态 */
   dragging?: boolean
   /** 作为拖拽放置目标——高亮边框视觉态 */
@@ -34,10 +36,9 @@ const emit = defineEmits<{
   start: []
   stop: []
   build: []
+  log: []
   edit: []
   delete: []
-  /** 点击卡片主体（进入详情） */
-  open: []
   /** 点击访问链接（用默认浏览器打开） */
   openUrl: [url: string]
 }>()
@@ -85,7 +86,7 @@ function urlOf(port: string): string {
     :class="[stateClass, { 'dragging': dragging, 'drag-over': dragOver }]"
     draggable="true"
     :data-project-id="props.project.id"
-    @click="emit('open')"
+    @click="emit('log')"
   >
     <!-- 头部：图标 + 名称 + 类型标签 + 状态 -->
     <div class="card-head">
@@ -148,9 +149,11 @@ function urlOf(port: string): string {
         :running="running"
         :busy="props.busy"
         :can-build="canBuild"
+        :build-state="props.buildState"
         @start="emit('start')"
         @stop="emit('stop')"
         @build="emit('build')"
+        @log="emit('log')"
         @edit="emit('edit')"
         @delete="emit('delete')"
       />

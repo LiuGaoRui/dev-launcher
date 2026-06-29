@@ -1,134 +1,102 @@
-// build store：构建状态机（阶段 7）。
+// build store：多项目后台构建状态。
 //
-// 职责：创建 Channel 订阅 build_project 的实时输出（stdout/stderr），
-// 按 kind 累积到 output；记录运行态、退出码、耗时、退出标志。
+// 构建改后台执行：startBuild 调 build_project（立即返回），然后轮询 get_build_status
+// 直到 running=false，把结果写入 states[id]。卡片读 states[id] 驱动构建按钮状态图标。
 //
-// Channel 生命周期（ADR-002）：startBuild 持有 channelRef 防 GC；
-// stopBuild 置 null 触发 GC，后端读取 task send 失败退出、child 由 kill_on_drop 回收。
-//
-// 调用约定：build_project 是 await 命令（跑到结束才 resolve），
-// 但实时输出通过 Channel 流式到达，故 startBuild 内部 fire-and-forget 调用，
-// 通过 onDone 回调通知完成（退出码已随 Exit 事件到达，命令 resolve 仅用于错误兜底）。
+// 支持多项目同时构建：每个项目独立一份状态 + 独立轮询定时器。
+// 构建输出实时写入 build.log，由日志页（详情页构建日志 Tab）订阅查看。
 
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
-import { Channel } from '@tauri-apps/api/core'
-import { buildProject } from '@/api/process'
-import type { BuildEvent, BuildResult } from '@/types/project'
+import { reactive } from 'vue'
+import { buildProject, getBuildStatus } from '@/api/process'
+import type { BuildState } from '@/types/project'
+import { safeCall } from '@/api/invoke'
+import { createDiscreteApi } from 'naive-ui'
 
-/** 单条构建输出行（带来源标记，便于前端着色区分 stderr） */
-export interface BuildLine {
-  kind: 'stdout' | 'stderr'
-  text: string
+const { message } = createDiscreteApi(['message'])
+
+/** 状态轮询间隔（ms） */
+const POLL_INTERVAL_MS = 1000
+
+/** 默认状态（从未构建过的项目） */
+function defaultState(): BuildState {
+  return { running: false, exit_code: 0, duration_ms: 0, error: '' }
 }
 
 export const useBuildStore = defineStore('build', () => {
-  /** 当前构建的项目 id */
-  const projectId = ref<number | null>(null)
-  /** 构建输出（按到达顺序，stdout/stderr 混合） */
-  const lines = ref<BuildLine[]>([])
-  /** 是否构建中 */
-  const running = ref(false)
-  /** 退出码（null=尚未退出） */
-  const exitCode = ref<number | null>(null)
-  /** 耗时（ms，退出后填） */
-  const durationMs = ref<number | null>(null)
-  /** 错误信息（命令本身抛错时填，如未配 build_cmd） */
-  const error = ref('')
+  /** 各项目构建状态：project_id → BuildState */
+  const states = reactive<Record<number, BuildState>>({})
 
-  /** 当前订阅的 Channel 引用（持有防 GC）。读取无意义，仅作为生命周期锚点保留 */
-  const channelRef = ref<Channel<BuildEvent> | null>(null)
-  /** 构建命令的 Promise（用于 abort/感知），实际不可中断，仅用于状态跟踪 */
-  let buildPromise: Promise<BuildResult> | null = null
-  /** 完成回调（一键发布编排用它知道构建结束） */
-  let doneResolver: ((r: BuildResult | null) => void) | null = null
+  /** 进行中的轮询定时器：project_id → 定时器句柄（停止构建/卸载时清理） */
+  const timers: Record<number, ReturnType<typeof setInterval>> = {}
+
+  /** 取某项目构建状态（无记录返回默认） */
+  function getState(id: number): BuildState {
+    return states[id] ?? defaultState()
+  }
 
   /**
-   * 启动构建。fire-and-forget 调用 buildProject，输出通过 Channel 流式到达。
-   * @returns Promise<BuildResult|null> resolve 时构建已结束（成功返回结果，失败返回 null）
+   * 触发后台构建：调 build_project（立即返回），开启状态轮询。
+   * @param id 项目 id
+   * @param onDone 可选：构建结束时回调（退出码作参数）
    */
-  async function startBuild(id: number): Promise<BuildResult | null> {
-    // 若上一个构建还在进行，先释放（同一时刻只支持一个构建面板）
-    stopBuild()
+  async function startBuild(id: number, onDone?: (exitCode: number) => void) {
+    // 先乐观标记为构建中（让卡片立即转圈）
+    states[id] = { running: true, exit_code: 0, duration_ms: 0, error: '' }
 
-    projectId.value = id
-    lines.value = []
-    running.value = true
-    exitCode.value = null
-    durationMs.value = null
-    error.value = ''
-
-    const channel = new Channel<BuildEvent>()
-    channel.onmessage = (ev: BuildEvent) => {
-      if (ev.kind === 'exit') {
-        exitCode.value = ev.data
-      } else {
-        lines.value.push({ kind: ev.kind, text: ev.data })
-      }
+    const [, err] = await safeCall(() => buildProject(id))
+    if (err) {
+      // 命令本身失败（如未配 build_cmd、已在构建中）：回滚为失败状态
+      states[id] = { running: false, exit_code: -1, duration_ms: 0, error: err }
+      message.error(`启动构建失败：${err}`)
+      onDone?.(-1)
+      return
     }
-    channelRef.value = channel
 
-    // 返回一个在构建结束时 resolve 的 Promise（供编排等待）
-    const done = new Promise<BuildResult | null>((resolve) => {
-      doneResolver = resolve
-    })
-
-    // fire-and-forget：build_project 会 await 到进程退出
-    buildPromise = buildProject(id, channel)
-    buildPromise
-      .then((r) => {
-        durationMs.value = r.duration_ms
-        running.value = false
-        doneResolver?.(r)
-        doneResolver = null
-        return r
-      })
-      .catch((e) => {
-        error.value = typeof e === 'string' ? e : (e as Error)?.message ?? String(e)
-        running.value = false
-        doneResolver?.(null)
-        doneResolver = null
-      })
-
-    return done
+    // 开启轮询，直到 running=false
+    pollStatus(id, onDone)
   }
 
-  /**
-   * 停止构建订阅（置 null 触发 GC → 后端读取 task 退出 → kill_on_drop 回收 child）。
-   * 注意：这是「放弃订阅」，不保证子进程立即终止（依赖后端 kill_on_drop）。
-   */
-  function stopBuild() {
-    channelRef.value = null
-    buildPromise = null
-    doneResolver = null
-    running.value = false
+  /** 轮询某项目的构建状态，结束后停表 + 回调 */
+  function pollStatus(id: number, onDone?: (exitCode: number) => void) {
+    stopPoll(id)
+    timers[id] = setInterval(async () => {
+      const s = await getBuildStatus(id)
+      states[id] = { ...s }
+      if (!s.running) {
+        stopPoll(id)
+        if (s.error) {
+          message.error(`构建失败：${s.error}`)
+        } else if (s.exit_code !== 0) {
+          message.error(`构建失败（退出码 ${s.exit_code}）`)
+        }
+        onDone?.(s.exit_code)
+      }
+    }, POLL_INTERVAL_MS)
   }
 
-  /** 重置全部状态（关闭对话框时调用） */
-  function reset() {
-    stopBuild()
-    projectId.value = null
-    lines.value = []
-    exitCode.value = null
-    durationMs.value = null
-    error.value = ''
+  /** 停止某项目的状态轮询（不杀构建进程，仅停止前端轮询） */
+  function stopPoll(id: number) {
+    const t = timers[id]
+    if (t) {
+      clearInterval(t)
+      delete timers[id]
+    }
   }
 
-  /** 构建是否成功结束（退出码 0） */
-  function isSucceeded(): boolean {
-    return exitCode.value === 0
+  /** 清空所有轮询定时器（卸载页面/离开时调用） */
+  function clearAllTimers() {
+    for (const key of Object.keys(timers)) {
+      clearInterval(timers[Number(key)])
+      delete timers[Number(key)]
+    }
   }
 
   return {
-    projectId,
-    lines,
-    running,
-    exitCode,
-    durationMs,
-    error,
+    states,
+    getState,
     startBuild,
-    stopBuild,
-    reset,
-    isSucceeded,
+    stopPoll,
+    clearAllTimers,
   }
 })

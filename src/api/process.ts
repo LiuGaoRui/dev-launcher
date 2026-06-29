@@ -1,9 +1,8 @@
 // process 命令薄包装。
 // 对齐 src-tauri/src/commands/process.rs：
-//   start_project / stop_project / build_project。
+//   start_project / stop_project / build_project / get_build_status。
 
-import { Channel } from '@tauri-apps/api/core'
-import type { BuildEvent, BuildResult, StartResult } from '@/types/project'
+import type { StartResult, BuildState } from '@/types/project'
 import { invokeCmd } from './invoke'
 
 /** 启动项目，返回 root pid / 日志路径 / 启动时间 */
@@ -17,12 +16,15 @@ export function stopProject(id: number): Promise<void> {
 }
 
 /**
- * 构建项目：执行 build_cmd，stdout/stderr 实时推 Channel，跑完返回退出码。
- * 调用方须持有 channel 引用直到不想再接收；释放引用触发 GC 后后端读取 task 退出。
+ * 触发后台构建：命令立即返回，构建在后台执行。
+ * 前端轮询 getBuildStatus 获取构建状态（running/exit_code）。
+ * 构建输出实时写入 build.log，由日志页订阅查看。
  */
-export function buildProject(
-  id: number,
-  onEvent: Channel<BuildEvent>,
-): Promise<BuildResult> {
-  return invokeCmd<BuildResult>('build_project', { id, onEvent })
+export function buildProject(id: number): Promise<void> {
+  return invokeCmd<void>('build_project', { id })
+}
+
+/** 查询某项目的构建状态（供轮询展示构建按钮状态图标） */
+export function getBuildStatus(id: number): Promise<BuildState> {
+  return invokeCmd<BuildState>('get_build_status', { id })
 }

@@ -52,6 +52,7 @@ pub fn run() {
             commands::process::start_project,
             commands::process::stop_project,
             commands::process::build_project,
+            commands::process::get_build_status,
             commands::process::probe_statuses,
             // scan_root
             commands::scan_root::list_scan_root_order,
@@ -61,8 +62,6 @@ pub fn run() {
             commands::system::get_app_memory,
             // log
             commands::log::subscribe_log,
-            commands::log::read_log_history,
-            commands::log::list_log_dates,
             commands::log::clear_log,
         ])
         .run(tauri::generate_context!())

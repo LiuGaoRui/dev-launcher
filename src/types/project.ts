@@ -72,26 +72,21 @@ export interface ProjectInput {
   enabled: boolean
 }
 
-/** start_project / restart_project 的返回值（对齐 Rust `StartResult`） */
+/** start_project 的返回值（对齐 Rust `StartResult`） */
 export interface StartResult {
   root_pid: number
   log_path: string
   started_at: string
 }
 
-/**
- * 构建输出事件（对齐 Rust `BuildEvent`，serde tag=kind/content=data）。
- *
- * kind=stdout/stderr 时 data 为文本；kind=exit 时 data 为退出码（数字）。
- * 前端用 discriminated union 收窄 data 类型。
- */
-export type BuildEvent =
-  | { kind: 'stdout'; data: string }
-  | { kind: 'stderr'; data: string }
-  | { kind: 'exit'; data: number }
-
-/** build_project 的返回值（对齐 Rust `BuildResult`） */
-export interface BuildResult {
+/** 后台构建状态（对齐 Rust `BuildState`，get_build_status 返回） */
+export interface BuildState {
+  /** 是否构建中 */
+  running: boolean
+  /** 退出码（构建结束才填，0=成功；running 期间无意义） */
   exit_code: number
+  /** 耗时（ms，构建结束才填） */
   duration_ms: number
+  /** 错误信息（命令本身抛错时填，如未配 build_cmd） */
+  error: string
 }

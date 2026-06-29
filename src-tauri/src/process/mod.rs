@@ -6,7 +6,7 @@
 //! - `registry`：ProcessRegistry，运行中进程注册表
 //! - `tree`：基于 sysinfo 收集后代 PID（供监控用）
 //! - `monitor`：监控探测（CPU/内存/端口，阶段 5）
-//! - `build`：构建执行（一次性跑完，piped stdout/stderr 推 Channel，阶段 7）
+//! - `build`：构建执行（后台跑完，stdout/stderr 重定向到 build.log）
 
 pub mod build;
 pub mod job_object;
@@ -15,8 +15,6 @@ pub mod registry;
 pub mod spawn;
 pub mod tree;
 
-pub use build::{BuildEvent, BuildResult};
-pub use monitor::{HealthStatus, PortStatus, ProjectStatus};
 pub use registry::ProcessRegistry;
 
 use serde::Serialize;

@@ -4,7 +4,7 @@
 // 布局：顶部工具栏 + 按「扫描目录」分组的程序面板。
 //   每个扫描目录一个面板标题头（显示扫描目录路径 + 项目数），下方放该目录扫描出的程序卡片。
 //   手动添加、无 scan_root 的项目归入「其他」面板。
-// 能力：新建/编辑/删除项目、启动/停止/重启、构建/发布、点击访问链接用默认浏览器打开。
+// 能力：新建/编辑/删除项目、启动/停止、构建（后台）、日志、点击访问链接用默认浏览器打开。
 // 排序：面板标题头可拖拽调整扫描目录顺序（持久化）；卡片可在同面板内拖拽排序（持久化）。
 // 编排：所有 store 操作在本页面集中进行，卡片组件无状态。
 
@@ -19,7 +19,6 @@ import type { Project, ProjectInput } from '@/types/project'
 import ProjectCard from '@/components/project/ProjectCard.vue'
 import ProjectFormDialog from '@/components/project/ProjectFormDialog.vue'
 import ProjectScanDialog from '@/components/project/ProjectScanDialog.vue'
-import BuildDialog from '@/components/project/BuildDialog.vue'
 
 const projectStore = useProjectStore()
 const buildStore = useBuildStore()
@@ -289,13 +288,13 @@ onMounted(async () => {
 })
 onBeforeUnmount(() => {
   projectStore.stopPolling()
-  buildStore.reset()
+  buildStore.clearAllTimers()
 })
 
-// ===== 启停重启 =====
+// ===== 启停 / 日志 / 构建 =====
 
-/** 点击卡片主体进入项目详情（日志面板） */
-function openDetail(p: Project) {
+/** 点击卡片主体或「日志」按钮：进入日志详情页（启动日志/构建日志双 Tab） */
+function handleLog(p: Project) {
   router.push({ name: 'ProjectDetail', params: { id: p.id } })
 }
 
@@ -315,26 +314,14 @@ async function handleOpenUrl(url: string) {
   if (err) message.error(`打开链接失败：${err}`)
 }
 
-// ===== 构建 / 一键发布（阶段 7） =====
-
-/** 构建对话框显隐 + 当前构建项目 */
-const buildDialogVisible = ref(false)
-const buildProjectName = ref('')
-
-/** 打开构建对话框并启动构建。构建期间标记 busy 禁用卡片操作条。 */
-async function handleBuild(p: Project) {
+/** 后台构建：不弹框、不设 busy，构建按钮由 buildStore 状态驱动图标。
+ *  支持多项目同时构建。 */
+function handleBuild(p: Project) {
   if (!p.build_cmd?.trim()) {
     message.warning('该项目未配置构建命令')
     return
   }
-  buildProjectName.value = p.name
-  buildDialogVisible.value = true
-  setBusy(p.id, true)
-  try {
-    await buildStore.startBuild(p.id)
-  } finally {
-    setBusy(p.id, false)
-  }
+  void buildStore.startBuild(p.id)
 }
 
 // ===== 删除 =====
@@ -485,14 +472,15 @@ async function stopAll() {
             :project="p"
             :status="projectStore.statuses[p.id] ?? null"
             :busy="busyIds.has(p.id)"
+            :build-state="buildStore.states[p.id]"
             :dragging="isCardDragging(p.id)"
             :drag-over="isCardDragOver(p.id)"
             @start="handleStart(p)"
             @stop="handleStop(p)"
             @build="handleBuild(p)"
+            @log="handleLog(p)"
             @edit="openEdit(p)"
             @delete="handleDelete(p)"
-            @open="openDetail(p)"
             @open-url="handleOpenUrl"
           />
         </div>
@@ -515,9 +503,6 @@ async function stopAll() {
       :submitting="submitting"
       @submit="handleSubmitForm"
     />
-
-    <!-- 构建日志对话框（阶段 7） -->
-    <BuildDialog v-model="buildDialogVisible" :project-name="buildProjectName" />
   </div>
 </template>
 

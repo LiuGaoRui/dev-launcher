@@ -1,28 +1,30 @@
-//! process 命令薄层：start_project / stop_project / restart_project / probe_statuses
+//! process 命令薄层：start_project / stop_project / build_project / get_build_status / probe_statuses
 //!
 //! 进程**脱离**管理器生命周期：spawn 不挂 Job Object、不设 kill_on_drop，
 //! 关闭软件后子进程继续运行。停止用 `taskkill /F /T` 杀整树；
 //! 重开软件后 probe_statuses 通过 DB last_pid + sysinfo 验活接管展示。
 //!
+//! 构建为后台执行：build_project 在 tokio::spawn 内跑 run_build，命令本身立即返回；
+//! 前端轮询 get_build_status 获取 running/exit_code。
+//!
 //! 签名对齐 docs/03-命令清单.md §四。
-//! 从 AppState 取 registry + logs_root + system，从 AppHandle 取 DB pool。
+//! 从 AppState 取 registry + logs_root + builds + system，从 AppHandle 取 DB pool。
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use sqlx::Row;
 use sysinfo::{Pid, ProcessesToUpdate, System};
-use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, Runtime};
 
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::models::now_iso;
-use crate::process::build::{run_build, BuildEvent, BuildResult};
+use crate::process::build::run_build;
 use crate::process::monitor::{collect_tcp_sockets, find_port_owner, probe_one, ProjectStatus};
 use crate::process::registry::{ProcessSnapshot, RunningProcess};
-use crate::process::spawn::{log_file_path, spawn_command};
+use crate::process::spawn::{spawn_command, start_log_path, truncate_log};
 use crate::process::StartResult;
 use crate::services::ProjectService;
 use crate::state::AppState;
@@ -68,8 +70,9 @@ pub async fn start_project<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResult<
         }
     }
 
-    // 计算日志路径
-    let log_path = log_file_path(state.logs_root(), &project.name)?;
+    // 计算启动日志路径 + spawn 前 truncate（保证 start.log 只含本次启动输出）
+    let log_path = start_log_path(state.logs_root(), &project.name)?;
+    truncate_log(&log_path);
     let started_at = now_iso();
 
     // spawn 进程
@@ -171,22 +174,95 @@ pub async fn stop_project<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResult<(
     Ok(())
 }
 
-/// 构建项目：执行 build_cmd，stdout/stderr 实时推 Channel，跑完返回退出码与耗时。
+/// 构建项目（后台执行）：tokio::spawn 跑 run_build，命令本身立即返回。
 ///
 /// 与 start_project 的区别：一次性进程（不入 registry、不用 Job Object），
-/// stdout/stderr 走 piped 实时推前端（不写日志文件），由 BuildResult 返回退出码。
+/// stdout/stderr 重定向到 `build.log`（构建前 truncate），由 log 模块的 tail task
+/// 实时推送给前端。退出码 + 耗时写入全局 builds 状态表，前端轮询 get_build_status。
 ///
-/// 命令会 await 到构建结束才返回；构建中前端关闭 Channel → 读取 task 退出 →
-/// kill_on_drop 兜底回收子进程。
+/// 并发约定：同一项目同时只允许一个构建（已在构建则返回 `AlreadyRunning`）；
+/// 不同项目可并发（多项目同时构建）。
 #[tauri::command]
-pub async fn build_project<R: Runtime>(
-    app: AppHandle<R>,
-    id: i64,
-    on_event: Channel<BuildEvent>,
-) -> AppResult<BuildResult> {
+pub async fn build_project<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResult<()> {
     let pool = db::pool(&app)?;
     let project = ProjectService::get(&pool, id).await?;
-    run_build(&project, on_event).await
+    let state = app.state::<AppState>();
+    let logs_root = state.logs_root().to_path_buf();
+
+    // 预检 build_cmd 非空（后台任务内也会校验，这里提前给前端即时错误）
+    let build_cmd = project.build_cmd.as_ref().ok_or_else(|| {
+        AppError::Process(format!("项目「{}」未配置构建命令", project.name))
+    })?;
+    if build_cmd.trim().is_empty() {
+        return Err(AppError::Process(format!(
+            "项目「{}」构建命令为空",
+            project.name
+        )));
+    }
+
+    // 同一项目已在构建中 → 拒绝；否则标记为构建中（原子 check-then-insert）
+    {
+        let mut builds = state.builds().lock().expect("builds mutex poisoned");
+        if let Some(bs) = builds.get(&id) {
+            if bs.running {
+                return Err(AppError::AlreadyRunning(id));
+            }
+        }
+        builds.insert(
+            id,
+            crate::state::BuildState {
+                running: true,
+                exit_code: 0,
+                duration_ms: 0,
+                error: String::new(),
+            },
+        );
+    }
+
+    // 后台跑 run_build：app clone 持有 AppState 引用，任务结束写回状态
+    let app2 = app.clone();
+    tokio::spawn(async move {
+        let result = run_build(&project, &logs_root).await;
+        let state2 = app2.state::<AppState>();
+        let mut builds = state2.builds().lock().expect("builds mutex poisoned");
+        match result {
+            Ok(r) => {
+                builds.insert(
+                    id,
+                    crate::state::BuildState {
+                        running: false,
+                        exit_code: r.exit_code,
+                        duration_ms: r.duration_ms,
+                        error: String::new(),
+                    },
+                );
+            }
+            Err(e) => {
+                builds.insert(
+                    id,
+                    crate::state::BuildState {
+                        running: false,
+                        exit_code: -1,
+                        duration_ms: 0,
+                        error: e.to_string(),
+                    },
+                );
+            }
+        }
+    });
+
+    Ok(())
+}
+
+/// 查询某项目的构建状态（供前端轮询展示构建按钮状态图标）。
+///
+/// 返回 `BuildState { running, exit_code, duration_ms, error }`。
+/// 从未构建过的项目返回默认值（running=false, exit_code=0）。
+#[tauri::command]
+pub async fn get_build_status<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResult<crate::state::BuildState> {
+    let state = app.state::<AppState>();
+    let builds = state.builds().lock().expect("builds mutex poisoned");
+    Ok(builds.get(&id).cloned().unwrap_or_default())
 }
 
 /// 探测项目运行态（CPU/内存/端口），阶段 5 监控面板用。
@@ -455,8 +531,7 @@ async fn fetch_runtime_info(
         let last_pid: Option<i64> = row.try_get("last_pid")?;
         let last_start_time: Option<String> = row.try_get("last_start_time")?;
         if let Some(pid) = last_pid {
-            let log_path = crate::process::spawn::log_file_path(logs_root, &name)
-                .unwrap_or_else(|_| PathBuf::new());
+            let log_path = crate::logs::paths::log_path_of(logs_root, &name, crate::logs::paths::LogType::Start);
             map.insert(
                 id,
                 ProcessSnapshot {

@@ -1,16 +1,15 @@
 <script setup lang="ts">
-// 项目详情页 —— 阶段 6 日志中心。
+// 项目详情页 —— 日志中心。
 //
 // 布局：
 //   顶部：面包屑（项目 / 项目名）+ 返回
 //   主体：
 //     - 项目信息卡（名称/类型/路径/启动命令/状态徽标）+ 实时指标
-//     - 日志面板
-//       - 实时模式：订阅 Channel，自动滚到底部，可清空当日日志
-//       - 历史模式：选日期（list_log_dates），按页加载
+//     - 日志面板（双 Tab：启动日志 / 构建日志）
+//       - 实时订阅对应日志文件（start.log / build.log），自动滚到底部，可清空
 //
-// 生命周期：进入默认实时订阅；离开 stopLive + reset 释放订阅。
-// 实时模式自动滚底通过 watch(lines) 实现。
+// 生命周期：进入默认订阅启动日志；离开 stopLive + reset 释放订阅。
+// 自动滚底通过 watch(lines) 实现。
 
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -19,9 +18,8 @@ import {
   NBreadcrumbItem,
   NEmpty,
   NTag,
-  NRadioGroup,
   NRadioButton,
-  NSelect,
+  NRadioGroup,
   NButton,
   useDialog,
 } from 'naive-ui'
@@ -29,6 +27,7 @@ import { getProject } from '@/api/project'
 import { PROJECT_TYPE_LABELS, type Project } from '@/types/project'
 import { useProjectStore } from '@/stores/project'
 import { useLogStore } from '@/stores/log'
+import type { LogType } from '@/types/log'
 import StatusBadge from '@/components/project/StatusBadge.vue'
 import MetricsBar from '@/components/project/MetricsBar.vue'
 
@@ -44,6 +43,9 @@ const loadErr = ref('')
 
 /** 日志区 DOM 引用（用于自动滚到底部） */
 const logBox = ref<HTMLPreElement | null>(null)
+
+/** 当前日志类型 Tab（start/build） */
+const logType = ref<LogType>('start')
 
 /** 从全局轮询状态取本项目探测结果（复用列表页的轮询） */
 const status = computed(() => projectStore.statuses[projectId.value] ?? null)
@@ -63,8 +65,8 @@ onMounted(async () => {
   // 确保轮询在运行（幂等：列表页已启动则 no-op；直接进详情页则在此启动）。
   projectStore.startPolling()
 
-  // 默认进入实时模式
-  await logStore.startLive(projectId.value)
+  // 默认订阅启动日志
+  await logStore.startLive(projectId.value, logType.value)
 })
 
 onBeforeUnmount(() => {
@@ -72,60 +74,31 @@ onBeforeUnmount(() => {
   logStore.reset()
 })
 
-// ===== 实时模式：自动滚到底部 =====
+// ===== 自动滚到底部 =====
 
 watch(
   () => logStore.lines,
   async () => {
-    if (logStore.mode !== 'live') return
     await nextTick()
     const box = logBox.value
     if (box) box.scrollTop = box.scrollHeight
   },
 )
 
-// ===== 模式切换 =====
+// ===== 切换日志类型 Tab =====
 
-async function switchMode(m: 'live' | 'history') {
-  if (m === logStore.mode) return
-  if (m === 'live') {
-    await logStore.startLive(projectId.value)
-  } else {
-    // 进入历史：先拉日期列表，默认选最新（当天）
-    await logStore.fetchDates(projectId.value)
-    const first = logStore.dates[0]
-    if (first) {
-      await logStore.loadHistory(projectId.value, first, true)
-    } else {
-      logStore.lines = ''
-    }
-  }
+async function switchLogType(t: LogType) {
+  if (t === logType.value) return
+  logType.value = t
+  await logStore.startLive(projectId.value, t)
 }
 
-// ===== 历史翻页 =====
-
-const historyDateOptions = computed(() =>
-  logStore.dates.map((d) => ({
-    label: `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`,
-    value: d,
-  })),
-)
-
-async function pickHistoryDate(date: string) {
-  if (!date) return
-  await logStore.loadHistory(projectId.value, date, true)
-}
-
-async function nextPage() {
-  await logStore.loadNextPage(projectId.value)
-}
-
-// ===== 清空日志 =====
+// ===== 清空当前类型日志 =====
 
 async function handleClear() {
   dialog.warning({
     title: '清空确认',
-    content: '确定清空当天日志吗？此操作不可恢复。',
+    content: `确定清空${logType.value === 'start' ? '启动' : '构建'}日志吗？此操作不可恢复。`,
     positiveText: '清空',
     negativeText: '取消',
     onPositiveClick: async () => {
@@ -197,41 +170,17 @@ const lineCount = computed(() => {
       <div class="log-card card-surface">
         <div class="log-header">
           <NRadioGroup
-            :value="logStore.mode"
+            :value="logType"
             size="small"
-            @update:value="(v: string) => switchMode(v as 'live' | 'history')"
+            @update:value="(v: string) => switchLogType(v as LogType)"
           >
-            <NRadioButton value="live">实时</NRadioButton>
-            <NRadioButton value="history">历史</NRadioButton>
+            <NRadioButton value="start">启动日志</NRadioButton>
+            <NRadioButton value="build">构建日志</NRadioButton>
           </NRadioGroup>
-
-          <!-- 历史模式：日期选择 + 翻页 -->
-          <div v-if="logStore.mode === 'history'" class="history-controls">
-            <NSelect
-              :value="logStore.historyDate"
-              :options="historyDateOptions"
-              size="small"
-              placeholder="选择日期"
-              style="width: 150px"
-              @update:value="(v: string) => pickHistoryDate(v)"
-            />
-            <NButton
-              size="small"
-              :disabled="!logStore.historyHasMore"
-              @click="nextPage"
-            >
-              加载更多
-            </NButton>
-          </div>
 
           <div class="log-actions">
             <span class="line-count">{{ lineCount }} 行</span>
-            <NButton
-              v-if="logStore.mode === 'live'"
-              size="small"
-              tertiary
-              @click="handleClear"
-            >
+            <NButton size="small" tertiary @click="handleClear">
               清空
             </NButton>
           </div>
@@ -325,11 +274,6 @@ const lineCount = computed(() => {
   border-bottom: 1px solid var(--divider);
   background: var(--toolbar-bg);
   flex-shrink: 0;
-}
-.history-controls {
-  display: flex;
-  align-items: center;
-  gap: 8px;
 }
 .log-actions {
   margin-left: auto;
