@@ -171,25 +171,6 @@ pub async fn stop_project<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResult<(
     Ok(())
 }
 
-/// 重启：stop → start。必须确认旧进程完全退出后再启动，否则端口占用。
-///
-/// 始终尝试 stop（容忍未运行的 `NotRunning` 错误），覆盖三种运行来源：
-/// registry 本会话进程 / DB last_pid 外部进程 / 端口发现的外部进程。
-/// stop 后短暂等待端口释放，避免 start 预检误判端口仍被占用。
-#[tauri::command]
-pub async fn restart_project<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResult<StartResult> {
-    // 先停止（容忍未运行）；stop 内部按 registry → DB last_pid → 端口发现三级回退定位 pid
-    match stop_project(app.clone(), id).await {
-        Ok(()) => {
-            // 等待端口释放：taskkill 异步回收，立即 start 可能预检命中残留 LISTEN
-            tokio::time::sleep(Duration::from_millis(WAIT_CLEANUP_INTERVAL_MS)).await;
-        }
-        Err(AppError::NotRunning(_)) => { /* 未运行，直接启动 */ }
-        Err(e) => return Err(e),
-    }
-    start_project(app, id).await
-}
-
 /// 构建项目：执行 build_cmd，stdout/stderr 实时推 Channel，跑完返回退出码与耗时。
 ///
 /// 与 start_project 的区别：一次性进程（不入 registry、不用 Job Object），

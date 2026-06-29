@@ -411,16 +411,24 @@ impl DetectService {
             .unwrap_or_default();
         // spring-boot ZIP layout：打包运行需 -Dloader.path=./lib
         let zip_layout = is_zip_layout(&stripped);
+        // 作者预构建的 release/ 目录（仅 ZIP layout 时检测；依赖更完整）
+        let release_rel = if zip_layout {
+            find_release_dir(dir).and_then(|p| {
+                let rel = relpath_cmd(root, &p);
+                if rel.is_empty() { None } else { Some(rel) }
+            })
+        } else {
+            None
+        };
 
         let schemes = Self::build_maven_schemes(
-            is_spring_boot,
             &jar_name,
-            &root_str,
             &cmd_rel,
             java_home.as_deref(),
             aggregator_rel.as_deref(),
             &module_name,
             zip_layout,
+            release_rel.as_deref(),
         );
 
         Ok(Some(MavenProbe::Project(DetectedProject {
@@ -555,33 +563,28 @@ impl DetectService {
 
     /// 生成 Maven 项目的启动方案。
     ///
-    /// - `is_spring_boot`：是否 SpringBoot（影响方案数量与命令）
+    /// 分步执行：start_cmd 只 `java -jar`（秒级启动），build_cmd = `mvn package`。
+    /// 改代码后手动：点「构建」→ 点「停止」→ 点「启动」。
+    /// 不再用 spring-boot:run（多模块项目传递依赖解析不可靠，会 NoClassDefFoundError）。
+    ///
     /// - `jar_name`：推断的 jar 文件名
-    /// - `root`：扫描根目录（= workdir，License 等运行时资源在此）
     /// - `mod_rel`：模块相对根目录的**命令路径**（如 "backend/hr"）；模块即扫描根时为空串
     /// - `java_home`：从启动脚本提取的 JAVA_HOME（多 JDK 项目用）；None 则用系统 PATH
     /// - `aggregator_rel`：父聚合器 pom 相对 root 的路径（多模块 reactor）；None 表示无聚合器
     /// - `module_name`：模块目录名（用于 mvn `-pl`，仅在聚合器场景生效）
     /// - `zip_layout`：spring-boot 是否 ZIP layout（打包运行需 `-Dloader.path=./lib`）
-    ///
-    /// 运行目录策略（spawn current_dir 按类型区分，见 spawn.rs）：
-    /// - Java 类：current_dir = workdir（root），mvn 用 `-f` 定位 pom
-    ///   （有聚合器时 `-f <聚合器> -pl <模块> -am` 跨 reactor 构建依赖；否则 `-f <mod_rel>/pom.xml`）
-    /// - 打包运行：current_dir = workdir（root）；ZIP layout 时用 `cd <mod_rel> &&` 切到模块目录，
-    ///   让 `-Dloader.path=./lib` 与 `target/<jar>` 相对模块目录定位
+    /// - `release_rel`：作者预构建的 `release/` 目录相对 root 的路径；有则优先从 release/ 运行
     #[allow(clippy::too_many_arguments)]
     fn build_maven_schemes(
-        is_spring_boot: bool,
         jar_name: &Option<String>,
-        root: &str,
         mod_rel: &str,
         java_home: Option<&str>,
         aggregator_rel: Option<&str>,
         module_name: &str,
         zip_layout: bool,
+        release_rel: Option<&str>,
     ) -> Vec<LaunchScheme> {
-        // 有 JAVA_HOME 时：mvn 前加 `set "JAVA_HOME=..." && `（让 Maven 用对的 JDK 运行插件）；
-        // java 用全路径（最可靠，不依赖 PATH）。
+        // 有 JAVA_HOME 时：mvn 前加 `set "JAVA_HOME=..." && `；java 用全路径
         let mvn_prefix = match java_home {
             Some(jh) => format!("set \"JAVA_HOME={jh}\" && "),
             None => String::new(),
@@ -591,158 +594,74 @@ impl DetectService {
             None => "java".to_string(),
         };
 
-        // mvn 用 -f 定位 pom：spawn cwd=workdir(root)。
-        // mvn -f 定位 pom 的参数。分两类用途：
-        // - f_param（含 -am）：install / package 等构建阶段，需 reactor 先构建兄弟模块依赖。
-        // - run_param（不含 -am）：spring-boot:run 只在启动模块跑（-am 会让 CLI goal 误跑到
-        //   无 mainClass 的根聚合器报错 "Unable to find a suitable main class"）。
-        //
-        // 有聚合器：-f <聚合器> -pl <模块>；构建阶段再加 -am。聚合器路径含空格/中文时加引号。
-        // 无聚合器：
-        //   - 模块在子目录（mod_rel 非空）：-f <mod_rel>/pom.xml（含空格加引号）
-        //   - 模块即扫描根（mod_rel 空）：-f pom.xml（cwd 已在根，避免中文目录名经 cmd.exe 乱码）
-        let (f_param, run_param) = if let Some(agg) = aggregator_rel {
+        // build_cmd = mvn package（改代码后手动点「构建」执行）
+        let f_param = if let Some(agg) = aggregator_rel {
             if !module_name.is_empty() {
                 let agg_quoted = if agg.contains(' ') {
                     format!("\"{agg}\"")
                 } else {
                     agg.to_string()
                 };
-                let base = format!("-f {agg_quoted} -pl {module_name} ");
-                // 构建阶段多带 -am（also-make：构建依赖的兄弟模块）
-                (format!("{base}-am "), base)
+                format!("-f {agg_quoted} -pl {module_name} -am ")
             } else {
-                // module_name 为空（理论上聚合器场景下不会），退回普通 -f
-                ("-f pom.xml ".to_string(), "-f pom.xml ".to_string())
+                "-f pom.xml ".to_string()
             }
         } else if mod_rel.is_empty() {
-            ("-f pom.xml ".to_string(), "-f pom.xml ".to_string())
+            "-f pom.xml ".to_string()
+        } else if mod_rel.contains(' ') {
+            format!("-f \"{mod_rel}/pom.xml\" ")
         } else {
-            let p = if mod_rel.contains(' ') {
-                format!("-f \"{mod_rel}/pom.xml\" ")
-            } else {
-                format!("-f {mod_rel}/pom.xml ")
-            };
-            (p.clone(), p)
+            format!("-f {mod_rel}/pom.xml ")
         };
+        let build_cmd = Some(format!("{mvn_prefix}mvn {f_param}clean package -DskipTests"));
 
-        // 打包构建：复用 f_param（有聚合器时同样走 -pl <module> -am，让 reactor 先构建兄弟模块）
-        let package_build = Some(format!("{mvn_prefix}mvn {f_param}clean package -DskipTests"));
-
-        // 打包运行命令。
-        // - 普通 jar：cwd=root，jar 在 <mod_rel>/target/ 下，路径从 root 相对指向；含空格加引号
-        // - ZIP layout（spring-boot PropertiesLauncher）：须 `-Dloader.path=./lib` 从 lib/ 加载
-        //   外挂依赖。loader.path 与 jar 路径都相对 cwd，而 lib/、target/ 在模块目录下 →
-        //   用 `cd <mod_rel> &&` 切到模块目录（含空格加引号），jar 路径退化为 target/<jar>。
-        //   （模块即扫描根时 mod_rel 空，cwd 已在根，cd 省略）
-        let jar_name_str = jar_name.clone().unwrap_or_else(|| "app.jar".to_string());
-        let jar_start = if zip_layout {
-            // cd 到模块目录（非空时），lib/ 与 target/<jar> 相对它定位
-            let cd = if mod_rel.is_empty() {
-                String::new()
-            } else if mod_rel.contains(' ') {
-                format!("cd \"{mod_rel}\" && ")
+        // start_cmd = 只 java -jar（秒级启动，不含打包）
+        // - ZIP layout：优先 release/（完整依赖），无则 target/（+ loader.path=./lib）
+        // - 普通 layout：target/<jar>，路径从 root 相对（含空格加引号）
+        let jar_name_str = jar_name.as_deref().unwrap_or("app.jar");
+        let start_cmd = if zip_layout {
+            if let Some(rel) = release_rel {
+                let cd = if rel.contains(' ') {
+                    format!("cd \"{rel}\" && ")
+                } else {
+                    format!("cd {rel} && ")
+                };
+                format!("{cd}{java_bin} -Dloader.path=./lib -jar {jar_name_str}")
             } else {
-                format!("cd {mod_rel} && ")
-            };
-            format!("{cd}{java_bin} -Dloader.path=./lib -jar target/{jar_name_str}")
+                let cd = if mod_rel.is_empty() {
+                    String::new()
+                } else if mod_rel.contains(' ') {
+                    format!("cd \"{mod_rel}\" && ")
+                } else {
+                    format!("cd {mod_rel} && ")
+                };
+                format!("{cd}{java_bin} -Dloader.path=./lib -jar target/{jar_name_str}")
+            }
         } else {
-            // 普通 jar：路径从 root 相对指向模块 target/；含空格整体加引号
-            let jar_rel_prefix = if mod_rel.is_empty() {
+            let prefix = if mod_rel.is_empty() {
                 "target/".to_string()
             } else {
                 format!("{mod_rel}/target/")
             };
-            let quoted = jar_rel_prefix.contains(' ');
-            if quoted {
-                format!("{java_bin} -jar \"{jar_rel_prefix}{jar_name_str}\"")
+            if prefix.contains(' ') {
+                format!("{java_bin} -jar \"{prefix}{jar_name_str}\"")
             } else {
-                format!("{java_bin} -jar {jar_rel_prefix}{jar_name_str}")
+                format!("{java_bin} -jar {prefix}{jar_name_str}")
             }
         };
 
-        if is_spring_boot {
-            let wd_param = format!("-Dspring-boot.run.workingDirectory=\"{root}\"");
-            // 多模块 reactor（有聚合器）：spring-boot:run 单独跑会因兄弟模块未 install 编译失败。
-            // 解法：start_cmd 先 install -pl <module> -am（构建阶段，Maven 增量，源码没变秒过），
-            // 再 spring-boot:run -pl <module>（不带 -am，避免 goal 误跑到无 mainClass 的根聚合器）。
-            // 无聚合器：单段 spring-boot:run（单模块项目，兄弟依赖已在本地仓库或无兄弟依赖）。
-            let has_agg = aggregator_rel.is_some();
-            // install 前缀：复用 mvn_prefix（JAVA_HOME）；构建阶段用 f_param（含 -am）
-            let install_seg = if has_agg {
-                format!("{mvn_prefix}mvn {f_param}install -DskipTests && ")
-            } else {
-                String::new()
-            };
-            let dev_desc = if has_agg {
-                "多模块项目：先 install 兄弟模块（Maven 增量编译，源码没变时秒级跳过）\
-                    再运行本模块。改了兄弟模块代码自动重编译重装；改启动模块代码重跑即可。"
-            } else {
-                "Maven fork 子进程运行，workingDirectory 设为项目根目录；\
-                    改代码重跑即可，日常开发最快。依赖多/路径长时若报 error=206 请用内嵌运行"
-            };
-            let embed_desc = if has_agg {
-                "多模块项目：先 install 兄弟模块（增量）再内嵌运行（fork=false 规避 Windows \
-                    classpath 超长 error=206）；运行时工作目录=扫描根，License 等资源须在扫描根目录"
-            } else {
-                "不 fork 子进程，在 Maven 同进程内运行，规避 Windows \
-                    classpath 超长（CreateProcess error=206）问题；运行时工作目录=扫描根，\
-                    License 等资源须放在扫描根目录"
-            };
-            let zip_note = if zip_layout {
-                "（spring-boot ZIP layout：已加 -Dloader.path=./lib 从 lib/ 加载外挂依赖）"
-            } else {
-                ""
-            };
-            let jar_desc = match jar_name {
-                Some(_) => format!("先构建 jar 再运行，模拟生产形态{zip_note}"),
-                None => format!(
-                    "先构建 jar 再运行；jar 名未能自动识别，请按实际产物修正{zip_note}"
-                ),
-            };
-            vec![
-                LaunchScheme {
-                    label: "开发模式".to_string(),
-                    // 有聚合器：install -pl -am && run -pl（run 不带 -am，goal 只在启动模块跑）
-                    recommended: !has_agg,
-                    start_cmd: format!(
-                        "{install_seg}{mvn_prefix}mvn {run_param}spring-boot:run {wd_param}"
-                    ),
-                    build_cmd: None,
-                    description: dev_desc.to_string(),
-                },
-                LaunchScheme {
-                    label: "开发模式（内嵌运行）".to_string(),
-                    recommended: false,
-                    start_cmd: format!(
-                        "{install_seg}{mvn_prefix}mvn {run_param}spring-boot:run -Dspring-boot.run.fork=false"
-                    ),
-                    build_cmd: None,
-                    description: embed_desc.to_string(),
-                },
-                LaunchScheme {
-                    label: "打包运行模式".to_string(),
-                    // 有聚合器的多模块项目：打包 jar 已构建立即可跑，设为推荐
-                    recommended: has_agg,
-                    start_cmd: jar_start,
-                    build_cmd: package_build,
-                    description: jar_desc,
-                },
-            ]
-        } else {
-            // 普通 JavaJar：仅打包运行
-            let desc = match jar_name {
-                Some(_) => "构建 jar 后运行",
-                None => "构建 jar 后运行；jar 名未能自动识别，请按实际产物修正",
-            };
-            vec![LaunchScheme {
-                label: "打包运行模式".to_string(),
-                recommended: true,
-                start_cmd: jar_start,
-                build_cmd: package_build,
-                description: desc.to_string(),
-            }]
-        }
+        let desc = match jar_name {
+            Some(_) => "运行已构建的 jar。改代码后请先点「构建」重新打包，再停止后重新启动",
+            None => "运行已构建的 jar；jar 名未能自动识别，请按实际产物修正",
+        };
+
+        vec![LaunchScheme {
+            label: "打包运行模式".to_string(),
+            recommended: true,
+            start_cmd,
+            build_cmd,
+            description: desc.to_string(),
+        }]
     }
 }
 
@@ -1142,6 +1061,35 @@ fn is_zip_layout(stripped_pom: &str) -> bool {
         return layout.trim().eq_ignore_ascii_case("ZIP");
     }
     false
+}
+
+/// 检测模块下是否存在作者预构建的运行时分发目录 `release/`。
+///
+/// ZIP layout 项目（如 hmsoft-boot-jar）的 `target/lib/`（copy-dependencies 生成）
+/// 可能依赖不完整（缺少部分第三方 jar）。而 `release/` 是作者打包好的完整分发：
+/// jar + 完整 lib/ + application.yml + license.lic，自包含可运行。
+///
+/// 判定：`dir/release/` 存在且至少含一个 jar 文件。命中返回该目录的绝对路径。
+fn find_release_dir(dir: &Path) -> Option<PathBuf> {
+    let release = dir.join("release");
+    if !release.is_dir() {
+        return None;
+    }
+    // 确认里面有 jar（而非空目录）
+    let entries = std::fs::read_dir(&release).ok()?;
+    for entry in entries.flatten() {
+        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            if entry
+                .path()
+                .extension()
+                .and_then(|e| e.to_str())
+                .map_or(false, |e| e.eq_ignore_ascii_case("jar"))
+            {
+                return Some(release);
+            }
+        }
+    }
+    None
 }
 
 /// 取 XML 中首个 <tag>...</tag> 文本（不处理嵌套同名标签）。
@@ -1699,198 +1647,144 @@ public class Helper {
     }
 
     #[test]
-    fn spring_boot_pom_produces_three_schemes() {
+    fn maven_scheme_start_jar_build_package() {
+        // start_cmd 只 java -jar；build_cmd = mvn package
         let schemes = DetectService::build_maven_schemes(
-            true,
             &Some("app.jar".to_string()),
-            "D:/code/repo",
             "svc",
             None,
             None,
             "svc",
             false,
+            None,
         );
-        assert_eq!(schemes.len(), 3);
-        // [0] 开发模式（默认）— -f 定位模块 + workingDirectory 让 fork JVM 在根目录运行
+        assert_eq!(schemes.len(), 1);
         assert!(schemes[0].recommended);
-        assert!(schemes[0]
-            .start_cmd
-            .contains("mvn -f svc/pom.xml spring-boot:run"));
-        assert!(schemes[0]
-            .start_cmd
-            .contains("-Dspring-boot.run.workingDirectory"));
-        assert!(schemes[0].build_cmd.is_none());
-        // [1] 开发模式（内嵌运行）— fork=false 规避 Windows error=206；不带 workingDirectory（fork=false 下无效）
-        assert!(!schemes[1].recommended);
-        assert!(schemes[1]
-            .start_cmd
-            .contains("mvn -f svc/pom.xml spring-boot:run -Dspring-boot.run.fork=false"));
-        assert!(!schemes[1]
-            .start_cmd
-            .contains("workingDirectory"));
-        assert!(schemes[1].build_cmd.is_none());
-        // [2] 打包运行模式 — jar 路径含模块相对路径（svc/target/）
-        assert!(schemes[2]
-            .start_cmd
-            .contains("java -jar svc/target/app.jar"));
-        // 构建命令走同样的 -f 定位（无聚合器）
+        // start_cmd 只有 java -jar（不含 package）
+        assert_eq!(schemes[0].start_cmd, "java -jar svc/target/app.jar");
+        // build_cmd = mvn package
         assert_eq!(
-            schemes[2].build_cmd.as_deref(),
+            schemes[0].build_cmd.as_deref(),
             Some("mvn -f svc/pom.xml clean package -DskipTests")
         );
     }
 
     #[test]
-    fn spring_boot_scheme_quotes_f_param_with_spaces() {
-        // 模块相对路径含空格（无聚合器场景，仅验证引号）：
-        // -f 和 jar 路径必须加引号，否则 cmd.exe 会在空格处截断导致 Maven 报
-        // "POM file HanXiInfotech specified the -f/--file does not exist"
+    fn maven_scheme_quotes_paths_with_spaces() {
+        // 路径含空格：-f 和 jar 路径都加引号
         let schemes = DetectService::build_maven_schemes(
-            true,
             &Some("purus.jar".to_string()),
-            "D:/code/repo",
             "HanXiInfotech OA Sever/hmsoft-boot-jar",
             None,
             None,
             "hmsoft-boot-jar",
             false,
+            None,
         );
-        assert_eq!(schemes.len(), 3);
-        // [0] 开发模式：-f 含空格 → 加引号
+        assert_eq!(schemes.len(), 1);
+        // build_cmd 的 -f 含空格 → 加引号
+        assert!(schemes[0]
+            .build_cmd
+            .as_ref()
+            .unwrap()
+            .contains("mvn -f \"HanXiInfotech OA Sever/hmsoft-boot-jar/pom.xml\" clean package"),
+            "expected quoted -f in build_cmd");
+        // start_cmd 的 jar 路径含空格 → 加引号
         assert!(schemes[0]
             .start_cmd
-            .contains("mvn -f \"HanXiInfotech OA Sever/hmsoft-boot-jar/pom.xml\" spring-boot:run"),
-            "expected quoted -f in: {}", schemes[0].start_cmd);
-        // [1] 内嵌运行：同样 -f 加引号
-        assert!(schemes[1]
-            .start_cmd
-            .contains("mvn -f \"HanXiInfotech OA Sever/hmsoft-boot-jar/pom.xml\" spring-boot:run -Dspring-boot.run.fork=false"));
-        // [2] 打包运行：jar 路径含空格 → 加引号
-        assert!(schemes[2]
-            .start_cmd
             .contains("java -jar \"HanXiInfotech OA Sever/hmsoft-boot-jar/target/purus.jar\""),
-            "expected quoted jar path in: {}", schemes[2].start_cmd);
+            "expected quoted jar path in: {}", schemes[0].start_cmd);
     }
 
     #[test]
-    fn spring_boot_scheme_aggregator_install_then_run() {
-        // 多模块 reactor（真实 hmsoft-boot-jar 场景）：
-        // 有聚合器 pom → 开发模式 = 「install -pl <module> -am && spring-boot:run -pl <module>」。
-        // install 段构建兄弟模块（含 -am）；run 段不带 -am（避免 goal 误跑到无 mainClass 的根聚合器）。
-        // 聚合器路径含空格 → 加引号。
+    fn maven_scheme_zip_layout_with_release() {
+        // ZIP layout + release/：start_cmd = cd release && java -jar；build_cmd = mvn package
         let schemes = DetectService::build_maven_schemes(
-            true,
             &Some("purus.jar".to_string()),
-            "D:/work/hanxiinfotech-oa-for-java-3.0",
             "HanXiInfotech OA Sever/hmsoft-boot-jar",
             None,
             Some("HanXiInfotech OA Sever/pom.xml"),
             "hmsoft-boot-jar",
             true, // ZIP layout
+            Some("HanXiInfotech OA Sever/hmsoft-boot-jar/release"),
         );
-        let agg = "-f \"HanXiInfotech OA Sever/pom.xml\"";
-        // [0] 开发模式（非推荐，因有聚合器）：install -pl -am && run -pl
-        assert!(!schemes[0].recommended, "有聚合器时打包模式应推荐，开发模式非推荐");
-        let dev = &schemes[0].start_cmd;
-        assert!(
-            dev.contains(&format!("mvn {agg} -pl hmsoft-boot-jar -am install -DskipTests && mvn {agg} -pl hmsoft-boot-jar spring-boot:run")),
-            "expected install -am && run (no -am) in: {dev}"
+        assert_eq!(schemes.len(), 1);
+        // start_cmd 从 release/ 运行
+        assert_eq!(
+            schemes[0].start_cmd,
+            "cd \"HanXiInfotech OA Sever/hmsoft-boot-jar/release\" && java -Dloader.path=./lib -jar purus.jar"
         );
-        // run 段不应带 -am（避免误跑到根聚合器）
-        assert!(!dev.contains("spring-boot:run -pl hmsoft-boot-jar -am"));
-        assert!(dev.contains("-Dspring-boot.run.workingDirectory"));
-        // 不应出现指向模块自身 pom 的 -f
-        assert!(!dev.contains("-f \"HanXiInfotech OA Sever/hmsoft-boot-jar/pom.xml\""));
-        // [1] 内嵌运行：同样 install -am && run -pl（fork=false）
-        let embed = &schemes[1].start_cmd;
-        assert!(embed.contains(&format!(
-            "mvn {agg} -pl hmsoft-boot-jar -am install -DskipTests && mvn {agg} -pl hmsoft-boot-jar spring-boot:run -Dspring-boot.run.fork=false"
-        )));
-        // [2] 打包运行（推荐，因有聚合器）：ZIP layout → -Dloader.path=./lib + cd 模块目录
-        assert!(schemes[2].recommended, "有聚合器时打包模式应推荐");
-        let pkg = &schemes[2].start_cmd;
-        assert!(
-            pkg.contains("cd \"HanXiInfotech OA Sever/hmsoft-boot-jar\" && java -Dloader.path=./lib -jar target/purus.jar"),
-            "expected zip-layout loader.path + cd in: {pkg}"
-        );
-        // 打包构建走聚合器 -pl -am（构建阶段需兄弟模块）
-        assert!(schemes[2]
+        // build_cmd 走聚合器 -pl -am
+        assert!(schemes[0]
             .build_cmd
             .as_ref()
             .unwrap()
-            .contains(&format!("mvn {agg} -pl hmsoft-boot-jar -am clean package")));
+            .contains("mvn -f \"HanXiInfotech OA Sever/pom.xml\" -pl hmsoft-boot-jar -am clean package"));
     }
 
     #[test]
     fn plain_jar_pom_produces_one_scheme() {
         let schemes = DetectService::build_maven_schemes(
-            false,
             &None,
-            "D:/code/repo",
             "cli",
             None,
             None,
             "cli",
             false,
+            None,
         );
         assert_eq!(schemes.len(), 1);
         assert!(schemes[0].recommended);
-        // jar 路径含模块相对路径
+        // start_cmd 只 java -jar
         assert!(schemes[0].start_cmd.contains("java -jar cli/target/"));
-        assert!(schemes[0].build_cmd.is_some());
+        // build_cmd = mvn package
+        assert_eq!(
+            schemes[0].build_cmd.as_deref(),
+            Some("mvn -f cli/pom.xml clean package -DskipTests")
+        );
     }
 
     #[test]
     fn spring_boot_scheme_when_module_is_root() {
-        // 模块即扫描根（mod_rel 空，如「审查Agent」根目录自带 pom.xml）
-        // -f 应退化为 -f pom.xml（cwd 已在根），不拼目录名（避免中文乱码 + 路径错）
+        // 模块即扫描根（mod_rel 空）
         let schemes = DetectService::build_maven_schemes(
-            true,
             &Some("app.jar".to_string()),
-            "D:/code/repo",
             "",
             None,
             None,
             "repo",
             false,
+            None,
         );
-        assert_eq!(schemes.len(), 3);
-        // [0] 开发模式：-f pom.xml（不带子目录前缀）
-        assert!(schemes[0]
-            .start_cmd
-            .contains("mvn -f pom.xml spring-boot:run"));
-        assert!(!schemes[0].start_cmd.contains("-f .*/pom.xml"));
-        // [1] 内嵌运行：同样 -f pom.xml
-        assert!(schemes[1]
-            .start_cmd
-            .contains("mvn -f pom.xml spring-boot:run -Dspring-boot.run.fork=false"));
-        // [2] 打包运行：jar 路径前缀 target/（无子目录）
-        assert!(schemes[2].start_cmd.contains("java -jar target/app.jar"));
+        assert_eq!(schemes.len(), 1);
+        // start_cmd 用 target/（无子目录前缀）
+        assert_eq!(schemes[0].start_cmd, "java -jar target/app.jar");
+        // build_cmd 用 -f pom.xml
+        assert_eq!(
+            schemes[0].build_cmd.as_deref(),
+            Some("mvn -f pom.xml clean package -DskipTests")
+        );
     }
 
     #[test]
     fn spring_boot_scheme_injects_java_home() {
-        // 有 JAVA_HOME 时：mvn 命令前加 set "JAVA_HOME=..." &&；java 用全路径
+        // 有 JAVA_HOME 时：build_cmd 前缀 set JAVA_HOME；start_cmd 用全路径 java
         let schemes = DetectService::build_maven_schemes(
-            true,
             &Some("app.jar".to_string()),
-            "D:/code/repo",
             "",
             Some("C:\\JAVA\\jdk-21.0.11"),
             None,
             "repo",
             false,
+            None,
         );
-        // 开发模式：mvn 前缀 set JAVA_HOME
+        // start_cmd 用全路径 java
+        assert_eq!(
+            schemes[0].start_cmd,
+            "\"C:\\JAVA\\jdk-21.0.11\\bin\\java.exe\" -jar target/app.jar"
+        );
+        // build_cmd 前缀 set JAVA_HOME
         assert!(schemes[0]
-            .start_cmd
-            .contains("set \"JAVA_HOME=C:\\JAVA\\jdk-21.0.11\" && mvn"));
-        // 打包运行：java 用全路径
-        assert!(schemes[2]
-            .start_cmd
-            .contains("\"C:\\JAVA\\jdk-21.0.11\\bin\\java.exe\" -jar target/app.jar"));
-        // 构建命令也带 JAVA_HOME（mod_rel 空 → -f pom.xml）
-        assert!(schemes[2]
             .build_cmd
             .as_ref()
             .unwrap()
@@ -1927,22 +1821,26 @@ public class Helper {
 
         let detected = DetectService::scan(&root.to_string_lossy()).await.unwrap();
         assert_eq!(detected.len(), 1);
-        // 打包运行方案应使用全路径 java（Java 21）
-        let pkg = detected[0]
-            .schemes
-            .iter()
-            .find(|s| s.label.contains("打包运行"))
-            .expect("应有打包运行方案");
-        assert!(pkg
+        // 单方案：分步执行（start_cmd 只 java -jar，build_cmd = mvn package）
+        let scheme = &detected[0].schemes[0];
+        // start_cmd 只 java -jar：用全路径 java（Java 21），不含 mvn
+        assert!(scheme
             .start_cmd
             .contains("\"C:\\JAVA\\jdk-21.0.11\\bin\\java.exe\""));
-        assert!(pkg.start_cmd.contains("target/review-agent-1.0.0.jar"));
-        // 构建命令也应注入 JAVA_HOME
-        assert!(pkg
+        assert!(scheme.start_cmd.contains("target/review-agent-1.0.0.jar"));
+        assert!(!scheme.start_cmd.contains("mvn"));
+        // build_cmd = mvn package（注入 JAVA_HOME 前缀）
+        assert!(scheme.build_cmd.is_some());
+        assert!(scheme
             .build_cmd
             .as_ref()
             .unwrap()
-            .contains("set \"JAVA_HOME=C:\\JAVA\\jdk-21.0.11\""));
+            .contains("set \"JAVA_HOME=C:\\JAVA\\jdk-21.0.11\" && mvn"));
+        assert!(scheme
+            .build_cmd
+            .as_ref()
+            .unwrap()
+            .contains("clean package"));
     }
 
     #[tokio::test]
@@ -1970,14 +1868,20 @@ public class Helper {
         let detected = DetectService::scan(&root.to_string_lossy()).await.unwrap();
         assert_eq!(detected.len(), 1);
         assert_eq!(detected[0].name, "review-agent");
-        // 命令应使用 -f pom.xml（模块即根），不应包含目录名前缀
-        let dev_cmd = &detected[0].schemes[0].start_cmd;
+        // 模块即扫描根：build_cmd 用 -f pom.xml（不含目录名前缀），start_cmd 用 target/
+        let build_cmd = detected[0].schemes[0]
+            .build_cmd
+            .as_deref()
+            .expect("应有 build_cmd");
         assert!(
-            dev_cmd.contains("-f pom.xml "),
-            "expected -f pom.xml in {dev_cmd}"
+            build_cmd.contains("-f pom.xml "),
+            "expected -f pom.xml in {build_cmd}"
         );
-        // 展示用 rel_path 仍是目录名（非空），但命令里不能拼它
-        assert!(!dev_cmd.contains("-f review-agent/"));
+        assert!(!build_cmd.contains("-f review-agent/"));
+        // start_cmd 用 target/（无子目录前缀）
+        assert!(detected[0].schemes[0]
+            .start_cmd
+            .contains("java -jar target/"));
     }
 
     #[tokio::test]
@@ -2032,7 +1936,7 @@ public class HrApplication {
         assert_eq!(back.r#type, ProjectType::Springboot);
         assert_eq!(back.name, "hr");
         assert_eq!(back.expected_ports, vec!["8088".to_string()]);
-        assert_eq!(back.schemes.len(), 3);
+        assert_eq!(back.schemes.len(), 1);
         assert_eq!(front.r#type, ProjectType::Node);
         assert_eq!(front.name, "web");
         assert_eq!(front.expected_ports, vec!["5173".to_string()]);

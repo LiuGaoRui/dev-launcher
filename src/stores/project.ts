@@ -17,7 +17,7 @@ import {
   deleteProject,
   reorderProjects,
 } from '@/api/project'
-import { startProject, stopProject, restartProject } from '@/api/process'
+import { startProject, stopProject } from '@/api/process'
 import { probeStatuses } from '@/api/monitor'
 import { listScanRootOrder, reorderScanRoots } from '@/api/scan_root'
 import type { Project, ProjectInput } from '@/types/project'
@@ -108,13 +108,6 @@ export const useProjectStore = defineStore('project', () => {
     void probeNow()
   }
 
-  /** 重启：stop → start */
-  async function restart(id: number) {
-    const r = await restartProject(id)
-    updateProjectMeta(id, r.root_pid, r.started_at)
-    void probeNow()
-    return r
-  }
 
   // ===== 运行态探测（阶段 5） =====
 
@@ -217,7 +210,6 @@ export const useProjectStore = defineStore('project', () => {
     remove,
     start,
     stop,
-    restart,
     probeNow,
     startPolling,
     stopPolling,

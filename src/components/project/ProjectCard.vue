@@ -33,9 +33,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   start: []
   stop: []
-  restart: []
   build: []
-  deploy: []
   edit: []
   delete: []
   /** 点击卡片主体（进入详情） */
@@ -152,9 +150,7 @@ function urlOf(port: string): string {
         :can-build="canBuild"
         @start="emit('start')"
         @stop="emit('stop')"
-        @restart="emit('restart')"
         @build="emit('build')"
-        @deploy="emit('deploy')"
         @edit="emit('edit')"
         @delete="emit('delete')"
       />

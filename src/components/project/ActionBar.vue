@@ -16,9 +16,7 @@ defineProps<{
 const emit = defineEmits<{
   start: []
   stop: []
-  restart: []
   build: []
-  deploy: []
   edit: []
   delete: []
 }>()
@@ -44,7 +42,6 @@ const emit = defineEmits<{
     >
       停止
     </NButton>
-    <NButton size="tiny" tertiary :disabled="busy" @click="emit('restart')">重启</NButton>
     <NButton
       size="tiny"
       tertiary
@@ -53,16 +50,6 @@ const emit = defineEmits<{
       @click="emit('build')"
     >
       构建
-    </NButton>
-    <NButton
-      size="tiny"
-      type="primary"
-      tertiary
-      :disabled="busy || !canBuild"
-      :title="canBuild ? '停止 → 构建 → 启动' : '未配置构建命令'"
-      @click="emit('deploy')"
-    >
-      发布
     </NButton>
     <NButton size="tiny" quaternary :disabled="busy" @click="emit('edit')">编辑</NButton>
     <NButton size="tiny" quaternary type="error" :disabled="busy" @click="emit('delete')">

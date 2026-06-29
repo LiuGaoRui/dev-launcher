@@ -309,11 +309,6 @@ async function handleStop(p: Project) {
   if (err) message.error(`停止失败：${err}`)
 }
 
-async function handleRestart(p: Project) {
-  const [, err] = await withBusy(p.id, () => projectStore.restart(p.id))
-  if (err) message.error(`重启失败：${err}`)
-}
-
 /** 点击访问链接：用系统默认浏览器打开 */
 async function handleOpenUrl(url: string) {
   const [, err] = await projectStore.safe(() => openUrl(url))
@@ -340,59 +335,6 @@ async function handleBuild(p: Project) {
   } finally {
     setBusy(p.id, false)
   }
-}
-
-/**
- * 一键发布：stop → build →（构建成功则）start。
- * 编排逻辑放前端（IPC 边界原则 §4.2：Rust 只做原子操作，组合在前端）。
- * 全程用 busy 标记该项目，禁用卡片操作条避免并发操作。
- */
-async function handleDeploy(p: Project) {
-  if (!p.build_cmd?.trim()) {
-    message.warning('该项目未配置构建命令')
-    return
-  }
-
-  dialog.warning({
-    title: '一键发布',
-    content: `确定一键发布「${p.name}」吗？将执行：停止 → 构建 → 启动。`,
-    positiveText: '发布',
-    negativeText: '取消',
-    onPositiveClick: async () => {
-      // 弹构建日志对话框（整个发布过程可见输出）
-      buildProjectName.value = p.name
-      buildDialogVisible.value = true
-
-      // 全程标记 busy，禁用卡片操作条防并发
-      setBusy(p.id, true)
-      try {
-        // 1. 停止（若在运行）
-        if (projectStore.isRunning(p.id)) {
-          const [, stopErr] = await projectStore.safe(() => projectStore.stop(p.id))
-          if (stopErr) {
-            message.error(`停止失败，已中止发布：${stopErr}`)
-            return
-          }
-        }
-
-        // 2. 构建（startBuild 返回的 Promise 在构建结束时 resolve）
-        const buildResult = await buildStore.startBuild(p.id)
-        if (!buildResult || buildResult.exit_code !== 0) {
-          message.error(`构建失败（退出码 ${buildStore.exitCode}），已中止发布`)
-          return
-        }
-
-        // 3. 启动
-        const [, startErr] = await projectStore.safe(() => projectStore.start(p.id))
-        if (startErr) {
-          message.error(`构建成功但启动失败：${startErr}`)
-          return
-        }
-      } finally {
-        setBusy(p.id, false)
-      }
-    },
-  })
 }
 
 // ===== 删除 =====
@@ -547,9 +489,7 @@ async function stopAll() {
             :drag-over="isCardDragOver(p.id)"
             @start="handleStart(p)"
             @stop="handleStop(p)"
-            @restart="handleRestart(p)"
             @build="handleBuild(p)"
-            @deploy="handleDeploy(p)"
             @edit="openEdit(p)"
             @delete="handleDelete(p)"
             @open="openDetail(p)"
