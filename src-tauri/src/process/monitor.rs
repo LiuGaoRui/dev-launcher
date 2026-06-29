@@ -61,7 +61,7 @@ pub struct ProjectStatus {
     pub health: HealthStatus,
     /// 根进程 PID（运行中时来自 registry snapshot）
     pub pid: Option<u32>,
-    /// 整树 CPU 占用百分比（多核机器可能 > 100）
+    /// 整树 CPU 占用百分比（归一化到 0-100，按逻辑核数折算）
     pub cpu_percent: f32,
     /// 整树内存（RSS）字节数
     pub memory_bytes: u64,
@@ -85,8 +85,10 @@ pub fn probe_one(
     // 收集整树 PID（含 root）用于 CPU/内存聚合 + 端口归属校验
     let tree_vec: Vec<u32> = collect_tree(snapshot.pid, system);
 
-    // CPU / 内存整树求和（迭代 Vec 即可，无需 HashSet）
-    let (cpu_percent, memory_bytes) = aggregate_tree(&tree_vec, system);
+    // CPU / 内存整树求和，再按逻辑核数归一化到 0-100
+    let (raw_cpu, memory_bytes) = aggregate_tree(&tree_vec, system);
+    let num_cpus = system.cpus().len().max(1) as f32;
+    let cpu_percent = raw_cpu / num_cpus;
 
     let tree_pids: HashSet<u32> = tree_vec.into_iter().collect();
 
@@ -126,7 +128,7 @@ pub fn probe_one(
 /// 对全树 PID 聚合 CPU（f32 求和）/ 内存（bytes 求和）。
 ///
 /// CPU 说明：sysinfo `cpu_usage()` 为「自上次 refresh 以来的平均」，
-/// 单进程值可能瞬时偏高，整树求和后作为粗略指标足够（前端只展示，不做精确告警）。
+/// 整树求和后除以逻辑核数归一化到 0-100，避免多核机器上数值远超 100% 造成困惑。
 fn aggregate_tree(tree_pids: &[u32], system: &System) -> (f32, u64) {
     let mut cpu = 0.0f32;
     let mut mem = 0u64;

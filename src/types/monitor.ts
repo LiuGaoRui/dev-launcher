@@ -33,7 +33,7 @@ export interface ProjectStatus {
   health: HealthStatus
   /** 根进程 PID（运行中时来自 registry snapshot） */
   pid: number | null
-  /** 整树 CPU 占用百分比（多核机器可能 > 100） */
+  /** 整树 CPU 占用百分比（已归一化到 0-100） */
   cpu_percent: number
   /** 整树内存（RSS）字节数 */
   memory_bytes: number
