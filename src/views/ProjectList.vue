@@ -8,7 +8,7 @@
 // 排序：面板标题头可拖拽调整扫描目录顺序（持久化）；卡片可在同面板内拖拽排序（持久化）。
 // 编排：所有 store 操作在本页面集中进行，卡片组件无状态。
 
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, onActivated, onDeactivated, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { NButton, NEmpty, NSpin, useMessage, useDialog } from 'naive-ui'
 import { useProjectStore } from '@/stores/project'
@@ -19,6 +19,8 @@ import type { Project, ProjectInput } from '@/types/project'
 import ProjectCard from '@/components/project/ProjectCard.vue'
 import ProjectFormDialog from '@/components/project/ProjectFormDialog.vue'
 import ProjectScanDialog from '@/components/project/ProjectScanDialog.vue'
+
+defineOptions({ name: 'ProjectList' })
 
 const projectStore = useProjectStore()
 const buildStore = useBuildStore()
@@ -281,19 +283,21 @@ async function loadAll() {
   await projectStore.fetchAll()
 }
 
-// 加载数据并启动监控轮询（阶段 5）：挂载时 start，卸载时 stop
+// 加载数据并启动监控轮询（KeepAlive 感知：激活时开始，暂停时停止）
 onMounted(async () => {
   await loadAll()
+})
+onActivated(() => {
   projectStore.startPolling()
 })
-onBeforeUnmount(() => {
+onDeactivated(() => {
   projectStore.stopPolling()
   buildStore.clearAllTimers()
 })
 
 // ===== 启停 / 日志 / 构建 =====
 
-/** 点击卡片主体或「日志」按钮：进入日志详情页（启动日志/构建日志双 Tab） */
+/** 点击「日志」按钮：进入日志详情页 */
 function handleLog(p: Project) {
   router.push({ name: 'ProjectDetail', params: { id: p.id } })
 }
@@ -472,7 +476,7 @@ async function stopAll() {
             :project="p"
             :status="projectStore.statuses[p.id] ?? null"
             :busy="busyIds.has(p.id)"
-            :build-state="buildStore.states[p.id]"
+            :build-state="buildStore.getState(p.id)"
             :dragging="isCardDragging(p.id)"
             :drag-over="isCardDragOver(p.id)"
             @start="handleStart(p)"

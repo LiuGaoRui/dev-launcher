@@ -50,7 +50,11 @@ const themeOverrides = computed<GlobalThemeOverrides>(() => ({
       <NDialogProvider>
         <NMessageProvider>
           <AppShell>
-            <RouterView />
+            <RouterView v-slot="{ Component }">
+              <KeepAlive :include="['ProjectList']">
+                <component :is="Component" />
+              </KeepAlive>
+            </RouterView>
           </AppShell>
         </NMessageProvider>
       </NDialogProvider>

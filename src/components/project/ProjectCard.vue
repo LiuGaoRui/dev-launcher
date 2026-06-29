@@ -86,7 +86,6 @@ function urlOf(port: string): string {
     :class="[stateClass, { 'dragging': dragging, 'drag-over': dragOver }]"
     draggable="true"
     :data-project-id="props.project.id"
-    @click="emit('log')"
   >
     <!-- 头部：图标 + 名称 + 类型标签 + 状态 -->
     <div class="card-head">
@@ -168,7 +167,6 @@ function urlOf(port: string): string {
   border: 1px solid var(--card-border);
   border-radius: 6px;
   padding: 12px 14px 12px 16px;
-  cursor: pointer;
   transition: border-color 0.12s, background 0.12s;
   display: flex;
   flex-direction: column;
