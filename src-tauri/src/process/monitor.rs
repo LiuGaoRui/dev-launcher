@@ -26,7 +26,7 @@ use sysinfo::{Pid, System};
 use tracing::warn;
 
 use crate::process::registry::ProcessSnapshot;
-use crate::process::tree::collect_tree;
+use crate::process::tree::{aggregate_tree, collect_tree};
 
 // ===== 序列化结构（对齐前端 types/monitor.ts，serde snake_case） =====
 
@@ -123,22 +123,6 @@ pub fn probe_one(
         ports,
         started_at: Some(snapshot.started_at.clone()),
     }
-}
-
-/// 对全树 PID 聚合 CPU（f32 求和）/ 内存（bytes 求和）。
-///
-/// CPU 说明：sysinfo `cpu_usage()` 为「自上次 refresh 以来的平均」，
-/// 整树求和后除以逻辑核数归一化到 0-100，避免多核机器上数值远超 100% 造成困惑。
-fn aggregate_tree(tree_pids: &[u32], system: &System) -> (f32, u64) {
-    let mut cpu = 0.0f32;
-    let mut mem = 0u64;
-    for &pid_u32 in tree_pids {
-        if let Some(proc) = system.process(Pid::from_u32(pid_u32)) {
-            cpu += proc.cpu_usage();
-            mem += proc.memory();
-        }
-    }
-    (cpu, mem)
 }
 
 /// 查某端口是否监听，以及占用者是否属于本项目进程树。

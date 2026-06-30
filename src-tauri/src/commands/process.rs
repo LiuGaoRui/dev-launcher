@@ -22,6 +22,7 @@ use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::models::now_iso;
 use crate::process::build::run_build;
+use crate::process::kill::kill_process_tree;
 use crate::process::monitor::{collect_tcp_sockets, find_port_owner, probe_one, ProjectStatus};
 use crate::process::registry::{ProcessSnapshot, RunningProcess};
 use crate::process::spawn::{spawn_command, start_log_path, truncate_log};
@@ -548,29 +549,4 @@ async fn fetch_runtime_info(
 /// 用 sysinfo 判断 PID 是否存活。
 fn pid_alive(pid: u32, system: &System) -> bool {
     system.process(Pid::from_u32(pid)).is_some()
-}
-
-/// 用 `taskkill /F /T /PID <pid>` 杀掉指定进程及其全部后代。
-///
-/// `/F` 强制终止，`/T` 递归杀子进程树。Windows 自带命令。
-#[cfg(windows)]
-async fn kill_process_tree(pid: u32) -> AppResult<()> {
-    use crate::process::spawn::CREATE_NO_WINDOW;
-
-    let output = tokio::process::Command::new("taskkill")
-        .args(["/F", "/T", "/PID"])
-        .arg(pid.to_string())
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .await
-        .map_err(|e| AppError::Process(format!("调用 taskkill 失败: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::Process(format!(
-            "taskkill 终止进程 {pid} 失败: {}",
-            stderr.trim()
-        )));
-    }
-    Ok(())
 }

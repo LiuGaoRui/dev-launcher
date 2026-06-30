@@ -63,6 +63,10 @@ pub fn run() {
             // log
             commands::log::subscribe_log,
             commands::log::clear_log,
+            // cleaner（内存清理器）
+            commands::cleaner::scan_dev_processes,
+            commands::cleaner::kill_dev_processes,
+            commands::cleaner::get_system_memory,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

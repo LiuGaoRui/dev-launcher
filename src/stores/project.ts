@@ -10,6 +10,7 @@
 
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
+import { usePolling } from '@/composables/usePolling'
 import {
   listProjects,
   createProject,
@@ -37,8 +38,6 @@ export const useProjectStore = defineStore('project', () => {
   /** 扫描目录（面板）的排序记录：scan_root → sort_order。未记录的目录前端按字母序兜底。 */
   const scanRootOrder = ref<Record<string, number>>({})
 
-  /** 轮询定时器句柄（null 表示未在轮询） */
-  let pollTimer: ReturnType<typeof setInterval> | null = null
   /** 防止并发 probe（上一轮未完成时跳过） */
   let probing = false
 
@@ -128,20 +127,7 @@ export const useProjectStore = defineStore('project', () => {
     }
   }
 
-  /** 启动 3s 轮询（幂等：已运行则忽略） */
-  function startPolling() {
-    if (pollTimer !== null) return
-    void probeNow()
-    pollTimer = setInterval(() => void probeNow(), POLL_INTERVAL_MS)
-  }
-
-  /** 停止轮询 */
-  function stopPolling() {
-    if (pollTimer !== null) {
-      clearInterval(pollTimer)
-      pollTimer = null
-    }
-  }
+  const { start: startPolling, stop: stopPolling } = usePolling(probeNow, POLL_INTERVAL_MS)
 
   /** 取某项目的健康状态（无探测结果 → stopped） */
   function getHealth(id: number): HealthStatus {

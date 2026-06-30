@@ -4,7 +4,7 @@
 // 三段布局：
 //   左：应用图标 + 名称（可点击区域，但不可拖动整窗避免误触）
 //   中：拖动区域（data-tauri-drag-region）—— 双击切换最大化
-//   右：主题切换开关 + Windows 三按钮（最小化 / 最大化-还原 / 关闭）
+//   右：清理入口 + 主题切换开关 + Windows 三按钮（最小化 / 最大化-还原 / 关闭）
 //
 // 依赖 tauri.conf.json decorations:false，窗口本身已无系统标题栏。
 // Tauri 的 drag region 通过 data-tauri-drag-region 属性自动接管拖动。
@@ -18,6 +18,7 @@ import {
   CloseOutline,
   MoonOutline,
   SunnyOutline,
+  ServerOutline,
 } from '@vicons/ionicons5'
 import { useThemeStore } from '@/stores/theme'
 import {
@@ -26,11 +27,15 @@ import {
   closeWindow,
   onMaximizedChange,
 } from '@/utils/window'
+import CleanerDrawer from '@/components/cleaner/CleanerDrawer.vue'
 
 const themeStore = useThemeStore()
 
 /** 当前是否最大化（驱动按钮图标：Expand ↔ Contract） */
 const maximized = ref(false)
+
+/** 内存清理抽屉开关 */
+const cleanerVisible = ref(false)
 
 let cleanup: (() => void) | null = null
 
@@ -56,8 +61,11 @@ onBeforeUnmount(() => {
     <!-- 中：拖动区域（双击切换最大化由系统处理） -->
     <div class="drag-region" data-tauri-drag-region />
 
-    <!-- 右：主题切换 + 窗口控制 -->
+    <!-- 右：清理入口 + 主题切换 + 窗口控制 -->
     <div class="trailing">
+      <button class="tool-btn" title="内存清理" @click="cleanerVisible = true">
+        <NIcon size="15"><ServerOutline /></NIcon>
+      </button>
       <NIcon
         v-if="themeStore.isDark"
         class="theme-icon"
@@ -88,6 +96,9 @@ onBeforeUnmount(() => {
         <NIcon size="14"><CloseOutline /></NIcon>
       </button>
     </div>
+
+    <!-- 内存清理抽屉 -->
+    <CleanerDrawer v-model:show="cleanerVisible" />
   </div>
 </template>
 
@@ -154,6 +165,26 @@ onBeforeUnmount(() => {
 }
 .theme-icon:hover {
   opacity: 1;
+}
+
+/* 功能按钮（清理等工具入口），比主题图标窄一些 */
+.tool-btn {
+  width: 36px;
+  height: 100%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--titlebar-fg);
+  cursor: pointer;
+  opacity: 0.7;
+  transition: opacity 0.15s, background 0.12s;
+  border-radius: 4px;
+}
+.tool-btn:hover {
+  opacity: 1;
+  background: var(--titlebar-btn-hover);
 }
 
 /* Windows 风窗口控制按钮 */
