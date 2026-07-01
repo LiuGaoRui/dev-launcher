@@ -9,6 +9,7 @@ declare module 'vue' {
   export interface GlobalComponents {
     ActionBar: typeof import('./src/components/project/ActionBar.vue')['default']
     AppShell: typeof import('./src/components/layout/AppShell.vue')['default']
+    CleanerDrawer: typeof import('./src/components/cleaner/CleanerDrawer.vue')['default']
     MetricsBar: typeof import('./src/components/project/MetricsBar.vue')['default']
     PlaceholderPage: typeof import('./src/components/PlaceholderPage.vue')['default']
     ProjectCard: typeof import('./src/components/project/ProjectCard.vue')['default']

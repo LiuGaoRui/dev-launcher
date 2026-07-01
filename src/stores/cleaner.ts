@@ -5,17 +5,44 @@
 //
 // 轮询生命周期由 CleanerDrawer 控制：抽屉打开时 startPolling()，关闭时 stopPolling()。
 // 杀进程操作不自动执行——所有清理都需用户确认后调用 killSelected()。
+//
+// 锁定机制：用户可锁定某些进程，锁定后该进程不可被选中、不可被清理/回收。
+// 锁定集持久化到 localStorage（跨会话保留），按 PID 索引。
 
 import { defineStore } from 'pinia'
 import { computed, reactive, ref } from 'vue'
-import { scanDevProcesses, killDevProcesses, getSystemMemory } from '@/api/cleaner'
-import type { DevProcInfo, KillResult, SystemMemory } from '@/types/cleaner'
+import { scanDevProcesses, killDevProcesses, trimDevProcesses, getSystemMemory } from '@/api/cleaner'
+import type { DevProcInfo, KillResult, SystemMemory, TrimResult } from '@/types/cleaner'
 import { CATEGORY_META } from '@/types/cleaner'
 import { safeCall } from '@/api/invoke'
 import { usePolling } from '@/composables/usePolling'
 
 /** 清理抽屉轮询间隔（ms）：比项目监控稍慢，5s 足够 */
 export const CLEANER_POLL_MS = 5000
+
+/** localStorage 键：锁定的进程 PID 集合（JSON 数组） */
+const LOCKED_PIDS_STORAGE_KEY = 'devlauncher:cleaner:lockedPids'
+
+/** 从 localStorage 加载锁定的 PID 集合 */
+function loadLockedPids(): Set<number> {
+  try {
+    const raw = localStorage.getItem(LOCKED_PIDS_STORAGE_KEY)
+    if (!raw) return new Set()
+    const arr = JSON.parse(raw) as number[]
+    return new Set(arr.filter((n) => typeof n === 'number'))
+  } catch {
+    return new Set()
+  }
+}
+
+/** 持久化锁定的 PID 集合到 localStorage */
+function saveLockedPids(pids: Set<number>) {
+  try {
+    localStorage.setItem(LOCKED_PIDS_STORAGE_KEY, JSON.stringify([...pids]))
+  } catch {
+    // localStorage 不可用时静默降级（仅当前会话有效）
+  }
+}
 
 export const useCleanerStore = defineStore('cleaner', () => {
   /** 扫描到的开发进程列表（按 tree_memory_bytes 降序，后端已排） */
@@ -24,10 +51,14 @@ export const useCleanerStore = defineStore('cleaner', () => {
   const systemMem = ref<SystemMemory | null>(null)
   /** 是否正在扫描中（防止并发） */
   const scanning = ref(false)
-  /** 是否正在执行清理 */
+  /** 是否正在执行清理（杀进程） */
   const killing = ref(false)
+  /** 是否正在执行内存回收（修剪工作集） */
+  const trimming = ref(false)
   /** 已选中的进程 PID 集合（用于批量清理）。reactive 原生代理 Set，无需重新赋值触发响应。 */
   const selectedPids = reactive(new Set<number>())
+  /** 锁定的进程 PID 集合（不可选中、不可清理、不可回收）。持久化到 localStorage。 */
+  const lockedPids = reactive(loadLockedPids())
 
   // ===== 扫描 =====
 
@@ -64,18 +95,42 @@ export const useCleanerStore = defineStore('cleaner', () => {
     return CATEGORY_META[p.category]?.protected === true
   }
 
-  /** 切换某进程的选中态（受保护进程忽略） */
+  /** 某进程是否被用户锁定（不可选中、不可清理、不可回收） */
+  function isLocked(p: DevProcInfo): boolean {
+    return lockedPids.has(p.pid)
+  }
+
+  /** 切换某进程的锁定态 */
+  function toggleLock(pid: number) {
+    if (lockedPids.has(pid)) {
+      lockedPids.delete(pid)
+    } else {
+      lockedPids.add(pid)
+      // 锁定时从选中集移除（锁定优先于选中）
+      selectedPids.delete(pid)
+    }
+    saveLockedPids(lockedPids)
+  }
+
+  /** 某进程是否可操作（非保护且非锁定）——选中、清理、回收的前置条件 */
+  function isActionable(p: DevProcInfo): boolean {
+    return !isProtected(p) && !isLocked(p)
+  }
+
+  /** 切换某进程的选中态（受保护或锁定的进程忽略） */
   function toggleSelect(pid: number) {
     const p = processes.value.find((x) => x.pid === pid)
-    if (!p || isProtected(p)) return
+    if (!p || !isActionable(p)) return
     if (selectedPids.has(pid)) selectedPids.delete(pid)
     else selectedPids.add(pid)
   }
 
-  /** 选中/取消选中全部推荐项 */
+  /** 选中/取消选中全部推荐项（跳过锁定的） */
   function selectAllRecommended() {
-    const recs = recommendedPids.value
-    // 若推荐项已全部选中 → 取消全部选中；否则全选推荐
+    // 仅推荐且未锁定的 PID 可参与全选
+    const recs = recommendedProcs.value.filter((p) => !isLocked(p)).map((p) => p.pid)
+    if (recs.length === 0) return
+    // 若可参与的推荐项已全部选中 → 取消全部选中；否则全选
     const allSelected = recs.every((pid) => selectedPids.has(pid))
     if (allSelected) {
       for (const pid of recs) selectedPids.delete(pid)
@@ -151,7 +206,9 @@ export const useCleanerStore = defineStore('cleaner', () => {
    * 与 killSelected 共用后端，但只杀一棵树且不依赖全局选择集。
    */
   async function killOne(p: DevProcInfo): Promise<[KillResult | null, string | null]> {
-    if (isProtected(p)) return [null, '受保护的 IDE 进程不可清理']
+    if (!isActionable(p)) {
+      return [null, isLocked(p) ? '该进程已锁定，不可清理' : '受保护的 IDE 进程不可清理']
+    }
     killing.value = true
     try {
       const [result, error] = await safeCall(() => killDevProcesses([p.tree_pid_list]))
@@ -165,12 +222,54 @@ export const useCleanerStore = defineStore('cleaner', () => {
     }
   }
 
+  // ===== 内存回收（修剪工作集，不杀进程） =====
+
+  /** 公共 trim 执行器：设置 loading → 调用后端 → 刷新列表。 */
+  async function doTrim(pids: number[]): Promise<[TrimResult | null, string | null]> {
+    if (pids.length === 0) return [null, null]
+    trimming.value = true
+    try {
+      const [result, error] = await safeCall(() => trimDevProcesses(pids))
+      if (error || !result) return [null, error]
+      void scan()
+      return [result, null]
+    } finally {
+      trimming.value = false
+    }
+  }
+
+  /** 回收所有已选中进程的内存（修剪工作集）。 */
+  function trimSelected(): Promise<[TrimResult | null, string | null]> {
+    const pids: number[] = []
+    for (const p of processes.value) {
+      if (selectedPids.has(p.pid)) pids.push(p.pid)
+    }
+    return doTrim(pids)
+  }
+
+  /** 回收单个进程的内存（行内「回收」按钮）。 */
+  function trimOne(p: DevProcInfo): Promise<[TrimResult | null, string | null]> {
+    if (isLocked(p)) return Promise.resolve([null, '该进程已锁定，不可回收'])
+    return doTrim([p.pid])
+  }
+
+  /** 一键回收全部开发进程的内存（含 IDE，跳过锁定的）。 */
+  function trimAll(): Promise<[TrimResult | null, string | null]> {
+    const pids: number[] = []
+    for (const p of processes.value) {
+      if (!isLocked(p)) pids.push(p.pid)
+    }
+    return doTrim(pids)
+  }
+
   return {
     processes,
     systemMem,
     scanning,
     killing,
+    trimming,
     selectedPids,
+    lockedPids,
     recommendedPids,
     totalRecommendedMemory,
     totalProcessMemory,
@@ -180,10 +279,16 @@ export const useCleanerStore = defineStore('cleaner', () => {
     startPolling,
     stopPolling,
     isProtected,
+    isLocked,
+    isActionable,
+    toggleLock,
     toggleSelect,
     selectAllRecommended,
     clearSelection,
     killSelected,
     killOne,
+    trimSelected,
+    trimOne,
+    trimAll,
   }
 })

@@ -57,6 +57,21 @@ pub struct DevProcInfo {
     pub cmdline: String,
     /// 从命令行提取的项目/模块提示（如 artifactId、package.json name）
     pub cmdline_hint: String,
+    /// 用户友好的展示名（如「IntelliJ IDEA」「VSCode 扩展宿主」「vite dev」），
+    /// 比单纯的进程名（code.exe / java.exe）更易辨识，用于前端列表主标题。
+    pub display_title: String,
+    /// 关联的项目/工作目录路径（从命令行 -jar/cwd/IDE 工作区等提取），可能为空。
+    /// 帮助用户判断「这是哪个项目的进程」，是「是否该清理」的关键决策信息。
+    pub project_path: String,
+    /// 进程工作目录（sysinfo Process::cwd()），可能为 None（权限不足或已退出）。
+    /// 比 project_path（从命令行推断）更权威，是「进程在哪个目录跑的」直接证据。
+    pub cwd: Option<String>,
+    /// 命令行语义化摘要：提取正在执行的主脚本 / main class / npm script 等，
+    /// 比 exe 路径更能说明「进程在做什么」。如 `vite.js --port 5173`、`com.example.App`。
+    pub cmdline_summary: String,
+    /// 正在执行的主程序名（最精简辨识），如 `server.js`、`Application`、`demo.jar`。
+    /// 用于 display_title 兜底和搜索匹配。
+    pub main_script: String,
     /// 本进程 RSS（字节）
     pub memory_bytes: u64,
     /// 整个进程树内存（含子进程，字节）
@@ -141,7 +156,6 @@ pub fn scan_dev_processes(system: &System, self_pid: Option<Pid>) -> Vec<DevProc
         let cmdline_vec = proc.cmd();
         let cmdline_full = join_cmdline(cmdline_vec);
         let cmdline_display = truncate_cmdline(&cmdline_full);
-        let cmdline_hint = extract_hint(cmdline_vec, &exe, &name);
 
         let ppid = proc.parent().map(|p| p.as_u32());
         let started_at = proc
@@ -156,6 +170,7 @@ pub fn scan_dev_processes(system: &System, self_pid: Option<Pid>) -> Vec<DevProc
             "node"
         };
 
+        // 先分类（display_title / project_path 依赖 category 做针对性提取）
         let category = classify(
             pid_u32,
             &name,
@@ -165,6 +180,17 @@ pub fn scan_dev_processes(system: &System, self_pid: Option<Pid>) -> Vec<DevProc
             &ide_pids,
             system,
         );
+
+        // 再基于分类提取展示信息
+        let cmdline_hint = extract_hint(cmdline_vec, &exe, &name);
+        let main_script = extract_main_script(cmdline_vec, &kind, &name);
+        let cmdline_summary = extract_cmdline_summary(cmdline_vec, &kind);
+        let cwd = proc
+            .cwd()
+            .map(|p| p.to_string_lossy().into_owned());
+        let display_title =
+            extract_display_title(&name, &exe, cmdline_vec, category, &main_script);
+        let project_path = extract_project_path(cmdline_vec, &exe, category, cwd.as_deref());
 
         let recommended = is_recommended(category, tree_mem, pid_u32, self_pid);
 
@@ -176,6 +202,11 @@ pub fn scan_dev_processes(system: &System, self_pid: Option<Pid>) -> Vec<DevProc
             exe,
             cmdline: cmdline_display,
             cmdline_hint,
+            display_title,
+            project_path,
+            cwd,
+            cmdline_summary,
+            main_script,
             memory_bytes: self_mem,
             tree_memory_bytes: tree_mem,
             cpu_percent,
@@ -461,6 +492,557 @@ fn truncate_cmdline(s: &str) -> String {
     }
 }
 
+/// JetBrains 产品名映射（exe 路径特征 → 产品中文名）。
+/// 用于 IDE 进程的 display_title，让用户一眼看出是 IDEA / WebStorm 还是其他产品。
+const JB_PRODUCTS: &[(&str, &str)] = &[
+    ("idea", "IntelliJ IDEA"),
+    ("idea64", "IntelliJ IDEA"),
+    ("webstorm", "WebStorm"),
+    ("webstorm64", "WebStorm"),
+    ("pycharm", "PyCharm"),
+    ("pycharm64", "PyCharm"),
+    ("goland", "GoLand"),
+    ("goland64", "GoLand"),
+    ("clion", "CLion"),
+    ("clion64", "CLion"),
+    ("phpstorm", "PhpStorm"),
+    ("phpstorm64", "PhpStorm"),
+    ("rubymine", "RubyMine"),
+    ("rubymine64", "RubyMine"),
+    ("rider", "Rider"),
+    ("rider64", "Rider"),
+    ("studio64", "Android Studio"), // Android Studio
+    ("studio", "Android Studio"),
+    ("fleet", "JetBrains Fleet"),
+    ("datagrip", "DataGrip"),
+    ("datagrip64", "DataGrip"),
+];
+
+/// 提取用户友好的展示名（display_title）。
+///
+/// 比 cmdline_hint（项目模块提示）更聚焦「这是什么程序」：
+/// - IDE：识别具体产品（IntelliJ IDEA / VSCode 主进程 / 扩展宿主 / 辅助进程）
+/// - dev server：识别框架（vite / webpack-dev-server / SpringBoot）
+/// - 构建 daemon：识别构建工具（Gradle Daemon / Maven）
+/// - 其他：退化到 cmdline_hint 或进程名
+fn extract_display_title(
+    name: &str,
+    exe: &str,
+    cmd: &[std::ffi::OsString],
+    category: DevProcCategory,
+    main_script: &str,
+) -> String {
+    let name_lower = name.to_ascii_lowercase();
+    let exe_lower = exe.to_ascii_lowercase();
+    let cmdline_lower = join_cmdline(cmd).to_ascii_lowercase();
+
+    // ===== IDE 进程：识别具体产品 + 角色 =====
+    if category == DevProcCategory::IdeMain {
+        // VSCode 系：区分主进程 / 扩展宿主 / 渲染进程等
+        if name_lower == "code.exe" || name_lower == "code" || exe_lower.contains("vscode") || exe_lower.contains("\\code.exe") {
+            if let Some(role) = identify_vscode_role(&cmdline_lower) {
+                return format!("VSCode {role}");
+            }
+            return "VSCode".to_string();
+        }
+        // JetBrains 系：从 exe 文件名匹配产品
+        let exe_file = exe_lower.split(['/', '\\']).next_back().unwrap_or(&name_lower);
+        let exe_stem = exe_file.trim_end_matches(".exe");
+        for (key, product) in JB_PRODUCTS {
+            if exe_stem == *key || name_lower.starts_with(key) {
+                return (*product).to_string();
+            }
+        }
+        // JetBrains 兜底：命令行含 idea 启动参数
+        if cmdline_lower.contains("com.intellij.idea") || cmdline_lower.contains("-didea.") {
+            return "IntelliJ IDEA".to_string();
+        }
+        if exe_lower.contains("jetbrains") {
+            return "JetBrains IDE".to_string();
+        }
+        return "IDE".to_string();
+    }
+
+    // ===== 构建 daemon =====
+    if category == DevProcCategory::BuildDaemon {
+        if cmdline_lower.contains("gradle") {
+            return "Gradle Daemon".to_string();
+        }
+        if cmdline_lower.contains("maven") || cmdline_lower.contains("plexus.classworlds") {
+            return "Maven".to_string();
+        }
+        if cmdline_lower.contains("kotlin") {
+            return "Kotlin Daemon".to_string();
+        }
+        if cmdline_lower.contains("scala") || cmdline_lower.contains("sbt") {
+            return "Scala/sbt".to_string();
+        }
+        if cmdline_lower.contains("catalina") {
+            return "Tomcat".to_string();
+        }
+        return "构建守护进程".to_string();
+    }
+
+    // ===== dev server：识别框架 =====
+    if category == DevProcCategory::DevServer {
+        return identify_dev_server_name(&cmdline_lower);
+    }
+
+    // ===== watcher =====
+    if category == DevProcCategory::Watcher {
+        if cmdline_lower.contains("tsc") {
+            return "tsc --watch".to_string();
+        }
+        if cmdline_lower.contains("nodemon") {
+            return "nodemon".to_string();
+        }
+        if cmdline_lower.contains("esbuild") {
+            return "esbuild --watch".to_string();
+        }
+        return "文件监视器".to_string();
+    }
+
+    // ===== orphan / other：优先用 main_script（正在执行什么），再退化 =====
+    // 这是对裸 node/java 进程辨识度提升的关键：node server.js → "server.js (node)"
+    if !main_script.is_empty() && main_script != name {
+        // 运行时类型后缀（java/node），帮助用户一眼看出技术栈
+        let kind_label = if is_java_process(name) { "java" } else { "node" };
+        return format!("{main_script} ({kind_label})");
+    }
+    // 兜底：尝试 cmdline_hint
+    let hint = extract_hint(cmd, exe, name);
+    if !hint.is_empty() && hint != name {
+        return hint;
+    }
+    name.to_string()
+}
+
+/// 从 VSCode 命令行参数识别进程角色（主进程 / 扩展宿主 / 渲染进程等）。
+fn identify_vscode_role(cmdline_lower: &str) -> Option<String> {
+    // VSCode 多进程通过 --type=<role> 区分，role 值取到空格/参数边界
+    // （含 hyphen，如 gpu-process）。命令行已转小写，故匹配用小写。
+    for token in cmdline_lower.split_whitespace() {
+        if let Some(value) = token.strip_prefix("--type=") {
+            // value 可能带引号或尾随参数，取到第一个非值字符
+            let role = value.trim_matches(|c: char| c == '"' || c == '\'');
+            return Some(match role {
+                "extensionhost" => "扩展宿主".to_string(),
+                "renderer" => "渲染进程".to_string(),
+                "gpu-process" => "GPU 进程".to_string(),
+                "utility" => "工具进程".to_string(),
+                "sharedarraybuffer" => "共享内存进程".to_string(),
+                other => format!("子进程({other})"),
+            });
+        }
+    }
+    // 无 --type 的通常是主进程
+    if cmdline_lower.contains(".code-workspace") || cmdline_lower.contains("--folder-uri") {
+        return Some("主进程".to_string());
+    }
+    None
+}
+
+/// 识别 dev server 框架名（用于 display_title）。
+fn identify_dev_server_name(cmdline_lower: &str) -> String {
+    // 按特征长度降序匹配，避免短串误命中
+    const MARKERS: &[(&str, &str)] = &[
+        ("react-scripts", "React dev server"),
+        ("vue-cli-service", "Vue dev server"),
+        ("webpack-dev-server", "webpack dev server"),
+        ("webpack serve", "webpack dev server"),
+        ("@vitejs", "vite dev server"),
+        ("vite", "vite dev server"),
+        ("next dev", "Next.js dev server"),
+        ("nuxt dev", "Nuxt dev server"),
+        ("astro dev", "Astro dev server"),
+        ("svelte-kit", "SvelteKit dev server"),
+        ("ng serve", "Angular dev server"),
+        ("@angular-devkit", "Angular dev server"),
+        ("spring-boot:run", "Spring Boot"),
+        ("spring-boot.run", "Spring Boot"),
+        ("springframework.boot.loader", "Spring Boot"),
+    ];
+    for (marker, label) in MARKERS {
+        if cmdline_lower.contains(marker) {
+            return (*label).to_string();
+        }
+    }
+    "dev server".to_string()
+}
+
+/// 提取进程正在执行的主程序名（main_script）——最精简的辨识信息。
+///
+/// 策略按运行时类型：
+/// - Node：第一个非选项位置参数（跳过 node.exe、- 开头选项、-e/-r 等带值选项的值），
+///   取其文件名（如 `vite.js`、`server.js`）；npm/yarn/pnpm 时取 script 名（如 `dev`）
+/// - Java：main class 简名（最后一个含包名的 class 取简名，如 `Application`），
+///   或 `-jar xxx.jar` 的 jar 文件名（如 `demo.jar`）
+/// - 其他：退化到进程名
+fn extract_main_script(cmd: &[std::ffi::OsString], kind: &str, name: &str) -> String {
+    // 跳过 exe 本身，从第二个参数开始
+    if cmd.len() < 2 {
+        return String::new();
+    }
+    let args: Vec<&std::ffi::OsString> = cmd.iter().skip(1).collect();
+
+    if kind == "java" {
+        return extract_java_main_script(&args);
+    }
+    // node 系
+    extract_node_main_script(&args, name)
+}
+
+/// 从 Java 命令行参数提取主程序名。
+fn extract_java_main_script(args: &[&std::ffi::OsString]) -> String {
+    // 优先：-jar xxx.jar → jar 文件名
+    if let Some(jar_idx) = args.iter().position(|s| **s == "-jar" || **s == "-jar\"") {
+        if let Some(jar) = args.get(jar_idx + 1) {
+            let jar_str = jar.to_string_lossy();
+            if let Some(file) = jar_str.split(['/', '\\']).next_back() {
+                return file.to_string();
+            }
+        }
+    }
+
+    // 否则找 main class：最后一个像包名的位置参数（含 `.` 且无路径分隔符）
+    // 形如 -cp ... com.example.Application
+    let mut last_class: Option<String> = None;
+    for arg in args {
+        let s = arg.to_string_lossy();
+        if s.starts_with('-') {
+            continue;
+        }
+        // main class 特征：含 . 分隔的标识符，无路径分隔符，不以 .jar 结尾
+        if s.contains('.')
+            && !s.contains('/')
+            && !s.contains('\\')
+            && !s.ends_with(".jar")
+            && !s.ends_with(".xml")
+            && !s.ends_with(".properties")
+        {
+            let cls = match s.rsplit_once('.') {
+                Some((_pkg, cls)) => cls.to_string(),
+                None => s.into_owned(),
+            };
+            last_class = Some(cls);
+        }
+    }
+    if let Some(cls) = last_class {
+        return cls;
+    }
+    String::new()
+}
+
+/// 从 Node 命令行参数提取主脚本名。
+fn extract_node_main_script(args: &[&std::ffi::OsString], name: &str) -> String {
+    let name_lower = name.to_ascii_lowercase();
+    let mut skip_next = false;
+    let mut script: Option<String> = None;
+
+    for arg in args {
+        let s = arg.to_string_lossy();
+
+        // 上一轮是带值选项（如 -e "code"），跳过当前值
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+
+        // 选项参数：跳过，部分带值选项标记跳过下一个
+        if s.starts_with('-') {
+            // node 的 -e/--eval <code>、-r/--require <module>、--inspect 等带值
+            let lower = s.to_ascii_lowercase();
+            if lower == "-e" || lower == "--eval" || lower == "-r" || lower == "--require" {
+                skip_next = true;
+            }
+            continue;
+        }
+
+        // 第一个位置参数 = 正在执行的脚本
+        if script.is_none() {
+            script = Some(s.to_string());
+        }
+    }
+
+    let Some(script) = script else {
+        return String::new();
+    };
+
+    // npm/yarn/pnpm run <script>：取 script 名而非 npm.exe
+    if name_lower == "npm.exe" || name_lower == "npm" {
+        // 形如 npm run dev → 找 "run" 后的 script 名
+        // 但通常 npm 会 spawn node 执行，这里 script 可能是 npm-cli 路径
+        // 取文件名即可
+    }
+
+    // 取文件名（去掉路径），保留扩展名
+    let file = script.split(['/', '\\']).next_back().unwrap_or(&script);
+    file.to_string()
+}
+
+/// 提取命令行语义化摘要（cmdline_summary）——比 main_script 更完整的辨识信息。
+///
+/// 与 main_script（纯程序名）的区别：cmdline_summary 包含关键参数，
+/// 让用户看到「进程在怎么跑」。如 `vite.js --port 5173`、`-jar demo.jar --server.port=8080`。
+fn extract_cmdline_summary(cmd: &[std::ffi::OsString], kind: &str) -> String {
+    if cmd.len() < 2 {
+        return String::new();
+    }
+    let args: Vec<&std::ffi::OsString> = cmd.iter().skip(1).collect();
+
+    // 收集有辨识度的片段：主脚本 + 关键参数（端口、环境、配置）
+    let mut parts: Vec<String> = Vec::new();
+    let mut main_added = false;
+
+    let mut skip_next = false;
+    for arg in &args {
+        let s = arg.to_string_lossy();
+
+        if skip_next {
+            skip_next = false;
+            // 带值选项的值通常无辨识度，跳过（除非是端口等，但 -p <port> 这种少见）
+            continue;
+        }
+
+        if s.starts_with('-') {
+            let lower = s.to_ascii_lowercase();
+            if kind == "java" && (lower == "-e" || lower == "--eval") {
+                skip_next = true;
+                continue;
+            }
+            if lower == "-r" || lower == "--require" {
+                skip_next = true;
+                continue;
+            }
+            // 保留有辨识度的选项参数
+            if is_meaningful_arg(&s, kind) {
+                parts.push(s.to_string());
+            }
+            continue;
+        }
+
+        // 位置参数
+        if !main_added {
+            // 第一个位置参数是主脚本/程序，取文件名
+            let file = s.split(['/', '\\']).next_back().unwrap_or(&s);
+            parts.push(file.to_string());
+            main_added = true;
+        } else if is_meaningful_arg(&s, kind) {
+            // 后续位置参数也可能有意义（如 npm script 名 dev/build）
+            parts.push(s.to_string());
+        }
+    }
+
+    if parts.is_empty() {
+        return String::new();
+    }
+    // 截断到合理长度
+    let summary = parts.join(" ");
+    if summary.len() > 120 {
+        let truncated: String = summary.chars().take(120).collect();
+        format!("{truncated}…")
+    } else {
+        summary
+    }
+}
+
+/// 判断一个命令行参数是否有辨识度（值得放进 summary）。
+fn is_meaningful_arg(arg: &str, kind: &str) -> bool {
+    let lower = arg.to_ascii_lowercase();
+    // 端口、环境、配置类参数
+    if lower.contains("port")
+        || lower.contains("host")
+        || lower.contains("mode")
+        || lower.contains("env")
+        || lower.contains("config")
+    {
+        return true;
+    }
+    // Spring Boot 参数
+    if lower.contains("server.port") || lower.contains("spring.profiles") {
+        return true;
+    }
+    // node 常见有意义的位置参数（npm script 名）
+    if kind == "node" {
+        match lower.as_str() {
+            "dev" | "serve" | "start" | "build" | "watch" | "test" | "preview" => return true,
+            _ => {}
+        }
+    }
+    // 含路径分隔符的通常是文件路径，意义不大（太长），跳过
+    if arg.contains('/') || arg.contains('\\') {
+        return false;
+    }
+    // classpath 值等通常无辨识度，跳过
+    if lower.starts_with("-cp") || lower.starts_with("-classpath") {
+        return false;
+    }
+    false
+}
+
+/// 提取进程关联的项目/工作目录路径（project_path）。
+///
+/// 这是用户判断「该不该清理」的关键信息。提取策略（按分类）：
+/// - IDE：从命令行参数提取打开的工作区/文件夹路径
+/// - Java 服务：从 `-jar` 路径提取所在目录
+/// - Node dev server：从 node_modules 路径提取项目根目录
+/// - Gradle/Maven：从命令行参数提取项目路径
+fn extract_project_path(
+    cmd: &[std::ffi::OsString],
+    exe: &str,
+    category: DevProcCategory,
+    cwd: Option<&str>,
+) -> String {
+    // ===== IDE：提取工作区路径 =====
+    if category == DevProcCategory::IdeMain {
+        // VSCode：--folder-uri file:///path 或 位置参数中的目录路径
+        if let Some(path) = extract_vscode_workspace(cmd) {
+            return path;
+        }
+        // JetBrains：命令行最后的位置参数通常是项目目录
+        // idea64.exe ... /path/to/project
+        if let Some(path) = extract_positional_dir(cmd, exe) {
+            return path;
+        }
+        return String::new();
+    }
+
+    // ===== Java 服务（-jar 路径的所在目录）=====
+    if let Some(jar_idx) = cmd.iter().position(|s| s == "-jar") {
+        if let Some(jar) = cmd.get(jar_idx + 1) {
+            let jar_str = jar.to_string_lossy();
+            if let Some(dir) = parent_dir(&jar_str) {
+                return dir;
+            }
+        }
+    }
+
+    // ===== Node：node_modules 路径的项目根 =====
+    if let Some(path) = cmd.iter().find_map(|s| {
+        let s = s.to_string_lossy();
+        let nm_idx = s.find("node_modules")?;
+        let dir = s[..nm_idx]
+            .split(['/', '\\'])
+            .filter(|p| !p.is_empty())
+            .next_back()?;
+        Some(dir.to_string())
+    }) {
+        return path;
+    }
+
+    // ===== Gradle/Maven：从 build.gradle / pom.xml 路径提取项目目录 =====
+    if category == DevProcCategory::BuildDaemon {
+        if let Some(path) = cmd.iter().find_map(|s| {
+            let s = s.to_string_lossy();
+            for marker in &["build.gradle", "settings.gradle", "pom.xml"] {
+                if s.contains(marker) {
+                    return parent_dir(&s);
+                }
+            }
+            None
+        }) {
+            return path;
+        }
+    }
+
+    // 所有命令行提取都失败时，回退到进程工作目录（cwd）
+    // cwd 是 OS 报告的真实工作目录，比命令行推断更权威
+    if let Some(c) = cwd {
+        if !c.is_empty() {
+            return c.to_string();
+        }
+    }
+
+    String::new()
+}
+
+/// 提取 VSCode 命令行中的工作区路径。
+/// 支持两种参数形式：`--folder-uri=value` 和 `--folder-uri value`（独立 token）。
+fn extract_vscode_workspace(cmd: &[std::ffi::OsString]) -> Option<String> {
+    let mut iter = cmd.iter().peekable();
+    while let Some(s) = iter.next() {
+        let s = s.to_string_lossy();
+        let lower = s.to_ascii_lowercase();
+        if lower.starts_with("--folder-uri") || lower.starts_with("--file-uri") {
+            // 形式 1：--folder-uri=value
+            if let Some(val) = s.splitn(2, '=').nth(1) {
+                return Some(decode_file_uri(val));
+            }
+            // 形式 2：--folder-uri <value>（值为下一个 token）
+            if let Some(next) = iter.peek() {
+                let next = next.to_string_lossy();
+                if !next.starts_with('-') {
+                    return Some(decode_file_uri(&next));
+                }
+            }
+        }
+    }
+    // 位置参数中的目录路径（非 .exe 开头的路径参数）
+    extract_positional_dir(cmd, "")
+}
+
+/// 从位置参数中提取看起来像项目目录的路径。
+/// 跳过以 `-` 开头的选项参数和 exe 本身。
+fn extract_positional_dir(cmd: &[std::ffi::OsString], exe: &str) -> Option<String> {
+    let exe_lower = exe.to_ascii_lowercase();
+    for s in cmd.iter().skip(1) {
+        // 跳过第一个（通常是 exe 路径）
+        let s = s.to_string_lossy();
+        if s.starts_with('-') {
+            continue;
+        }
+        let lower = s.to_ascii_lowercase();
+        // 跳过 exe 本身、.code-workspace 之外的纯文件
+        if lower == exe_lower || lower.ends_with(".exe") {
+            continue;
+        }
+        // 含路径分隔符 → 可能是项目目录
+        if s.contains('/') || s.contains('\\') {
+            return Some(s.to_string());
+        }
+        // 无分隔符但像目录名（IDEA 有时传纯目录名）
+        if !s.contains('.') && s.len() > 1 {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
+/// 从 file:/// URI 解码出本地路径。
+fn decode_file_uri(uri: &str) -> String {
+    let s = uri.strip_prefix("file://").unwrap_or(uri);
+    // Windows 路径 file:///C:/... → 去掉前导 /
+    let s = s.strip_prefix('/').unwrap_or(s);
+    // 还原百分号编码（%20 → 空格等，简化处理常见情况）
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let hex1 = chars.next();
+            let hex2 = chars.next();
+            if let (Some(h1), Some(h2)) = (hex1, hex2) {
+                if let Ok(byte) = u8::from_str_radix(&format!("{h1}{h2}"), 16) {
+                    result.push(byte as char);
+                    continue;
+                }
+            }
+            result.push(c);
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// 取路径的父目录（去掉最后一段）。如 /a/b/c.jar → /a/b
+fn parent_dir(path: &str) -> Option<String> {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    match trimmed.rsplit_once(['/', '\\']) {
+        Some((dir, _file)) if !dir.is_empty() => Some(dir.to_string()),
+        _ => None,
+    }
+}
+
 /// 从命令行提取项目/模块提示，方便用户辨认进程归属。
 ///
 /// 优先级：
@@ -698,5 +1280,295 @@ mod tests {
         let system = System::new();
         let (cpu, mem) = aggregate_tree(&[0xFFFF_FFFF], &system);
         assert_eq!((cpu, mem), (0.0, 0));
+    }
+
+    // ===== display_title 测试 =====
+
+    #[test]
+    fn display_title_idea() {
+        let cmd: Vec<std::ffi::OsString> = vec!["idea64.exe".into()];
+        let title = extract_display_title(
+            "idea64.exe",
+            "C:\\Program Files\\JetBrains\\IntelliJ IDEA\\bin\\idea64.exe",
+            &cmd,
+            DevProcCategory::IdeMain,
+            "",
+        );
+        assert_eq!(title, "IntelliJ IDEA");
+    }
+
+    #[test]
+    fn display_title_vscode_main() {
+        let cmd: Vec<std::ffi::OsString> = vec![
+            "Code.exe".into(),
+            "--folder-uri".into(),
+            "file:///C:/Users/proj".into(),
+        ];
+        let title = extract_display_title(
+            "Code.exe",
+            "C:\\Users\\user\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe",
+            &cmd,
+            DevProcCategory::IdeMain,
+            "",
+        );
+        assert_eq!(title, "VSCode 主进程");
+    }
+
+    #[test]
+    fn display_title_vscode_extension_host() {
+        let cmd: Vec<std::ffi::OsString> = vec![
+            "Code.exe".into(),
+            "--type=extensionHost".into(),
+        ];
+        let title = extract_display_title(
+            "Code.exe",
+            "C:\\AppData\\Microsoft VS Code\\Code.exe",
+            &cmd,
+            DevProcCategory::IdeMain,
+            "",
+        );
+        assert_eq!(title, "VSCode 扩展宿主");
+    }
+
+    #[test]
+    fn display_title_webstorm() {
+        let title = extract_display_title(
+            "webstorm64.exe",
+            "C:\\Program Files\\JetBrains\\WebStorm\\bin\\webstorm64.exe",
+            &[],
+            DevProcCategory::IdeMain,
+            "",
+        );
+        assert_eq!(title, "WebStorm");
+    }
+
+    #[test]
+    fn display_title_gradle_daemon() {
+        let cmd: Vec<std::ffi::OsString> = vec![
+            "java.exe".into(),
+            "-Dorg.gradle.launcher.daemon".into(),
+        ];
+        let title = extract_display_title("java.exe", "java", &cmd, DevProcCategory::BuildDaemon, "");
+        assert_eq!(title, "Gradle Daemon");
+    }
+
+    #[test]
+    fn display_title_vite_dev() {
+        let cmd: Vec<std::ffi::OsString> = vec![
+            "node.exe".into(),
+            "vite".into(),
+            "--port".into(),
+            "5173".into(),
+        ];
+        let title = extract_display_title("node.exe", "node", &cmd, DevProcCategory::DevServer, "");
+        assert_eq!(title, "vite dev server");
+    }
+
+    // ===== project_path 测试 =====
+
+    #[test]
+    fn project_path_from_jar() {
+        let cmd: Vec<std::ffi::OsString> = vec![
+            "java.exe".into(),
+            "-jar".into(),
+            "/opt/app/demo-service.jar".into(),
+        ];
+        let path = extract_project_path(&cmd, "java", DevProcCategory::Other, None);
+        assert_eq!(path, "/opt/app");
+    }
+
+    #[test]
+    fn project_path_from_node_modules() {
+        let cmd: Vec<std::ffi::OsString> = vec![
+            "node.exe".into(),
+            "D:\\projects\\myapp\\node_modules\\vite\\bin\\vite.js".into(),
+        ];
+        let path = extract_project_path(&cmd, "node", DevProcCategory::DevServer, None);
+        assert_eq!(path, "myapp");
+    }
+
+    #[test]
+    fn project_path_vscode_workspace() {
+        let cmd: Vec<std::ffi::OsString> = vec![
+            "Code.exe".into(),
+            "--folder-uri".into(),
+            "file:///C:/Users/dev/myproject".into(),
+        ];
+        let path = extract_project_path(&cmd, "C:\\VSCode\\Code.exe", DevProcCategory::IdeMain, None);
+        assert_eq!(path, "C:/Users/dev/myproject");
+    }
+
+    #[test]
+    fn project_path_gradle_build_file() {
+        let cmd: Vec<std::ffi::OsString> = vec![
+            "java.exe".into(),
+            "/home/user/myproject/build.gradle".into(),
+        ];
+        let path = extract_project_path(&cmd, "java", DevProcCategory::BuildDaemon, None);
+        assert_eq!(path, "/home/user/myproject");
+    }
+
+    #[test]
+    fn project_path_fallback_to_cwd() {
+        let cmd: Vec<std::ffi::OsString> = vec!["node.exe".into()];
+        let path = extract_project_path(&cmd, "node", DevProcCategory::Other, Some("D:\\project"));
+        assert_eq!(path, "D:\\project");
+    }
+
+    #[test]
+    fn project_path_empty_for_minimal_cmd() {
+        let cmd: Vec<std::ffi::OsString> = vec!["node.exe".into()];
+        let path = extract_project_path(&cmd, "node", DevProcCategory::Other, None);
+        assert!(path.is_empty());
+    }
+
+    #[test]
+    fn decode_file_uri_spaces() {
+        assert_eq!(
+            decode_file_uri("file:///C:/Users/My%20Documents/proj"),
+            "C:/Users/My Documents/proj"
+        );
+    }
+
+    #[test]
+    fn parent_dir_basic() {
+        assert_eq!(parent_dir("/a/b/c.jar"), Some("/a/b".to_string()));
+        assert_eq!(parent_dir("C:\\app\\demo.jar"), Some("C:\\app".to_string()));
+        assert_eq!(parent_dir("file.jar"), None);
+    }
+
+    // ===== main_script 测试 =====
+
+    #[test]
+    fn main_script_node_js_file() {
+        let cmd: Vec<std::ffi::OsString> = vec![
+            "node.exe".into(),
+            "D:\\project\\server.js".into(),
+            "--port".into(),
+            "3000".into(),
+        ];
+        let script = extract_main_script(&cmd, "node", "node.exe");
+        assert_eq!(script, "server.js");
+    }
+
+    #[test]
+    fn main_script_node_vite() {
+        let cmd: Vec<std::ffi::OsString> = vec![
+            "node.exe".into(),
+            "D:\\project\\node_modules\\vite\\bin\\vite.js".into(),
+        ];
+        let script = extract_main_script(&cmd, "node", "node.exe");
+        assert_eq!(script, "vite.js");
+    }
+
+    #[test]
+    fn main_script_java_jar() {
+        let cmd: Vec<std::ffi::OsString> = vec![
+            "java.exe".into(),
+            "-jar".into(),
+            "/opt/app/demo-service.jar".into(),
+        ];
+        let script = extract_main_script(&cmd, "java", "java.exe");
+        assert_eq!(script, "demo-service.jar");
+    }
+
+    #[test]
+    fn main_script_java_main_class() {
+        let cmd: Vec<std::ffi::OsString> = vec![
+            "java.exe".into(),
+            "-cp".into(),
+            "lib/*".into(),
+            "com.example.Application".into(),
+        ];
+        let script = extract_main_script(&cmd, "java", "java.exe");
+        assert_eq!(script, "Application");
+    }
+
+    #[test]
+    fn main_script_empty_for_bare_process() {
+        let cmd: Vec<std::ffi::OsString> = vec!["node.exe".into()];
+        let script = extract_main_script(&cmd, "node", "node.exe");
+        assert!(script.is_empty());
+    }
+
+    // ===== cmdline_summary 测试 =====
+
+    #[test]
+    fn summary_node_with_port() {
+        let cmd: Vec<std::ffi::OsString> = vec![
+            "node.exe".into(),
+            "vite.js".into(),
+            "--port".into(),
+            "5173".into(),
+        ];
+        let summary = extract_cmdline_summary(&cmd, "node");
+        assert!(summary.contains("vite.js"));
+        assert!(summary.contains("--port"));
+    }
+
+    #[test]
+    fn summary_java_jar_with_config() {
+        let cmd: Vec<std::ffi::OsString> = vec![
+            "java.exe".into(),
+            "-jar".into(),
+            "app.jar".into(),
+            "--spring.profiles.active=dev".into(),
+        ];
+        let summary = extract_cmdline_summary(&cmd, "java");
+        assert!(summary.contains("app.jar"));
+        assert!(summary.contains("spring.profiles"));
+    }
+
+    #[test]
+    fn summary_truncates_long() {
+        let long_arg = "x".repeat(150);
+        let cmd: Vec<std::ffi::OsString> = vec!["node.exe".into(), long_arg.into()];
+        let summary = extract_cmdline_summary(&cmd, "node");
+        assert!(summary.ends_with('…'));
+    }
+
+    // ===== display_title Other 分支（用 main_script）测试 =====
+
+    #[test]
+    fn display_title_other_node_with_script() {
+        let cmd: Vec<std::ffi::OsString> = vec![
+            "node.exe".into(),
+            "server.js".into(),
+        ];
+        let title = extract_display_title(
+            "node.exe",
+            "C:\\node.exe",
+            &cmd,
+            DevProcCategory::Other,
+            "server.js",
+        );
+        assert_eq!(title, "server.js (node)");
+    }
+
+    #[test]
+    fn display_title_other_java_with_class() {
+        let cmd: Vec<std::ffi::OsString> = vec![
+            "java.exe".into(),
+            "com.example.App".into(),
+        ];
+        let title = extract_display_title(
+            "java.exe",
+            "java",
+            &cmd,
+            DevProcCategory::Orphan,
+            "App",
+        );
+        assert_eq!(title, "App (java)");
+    }
+
+    // ===== is_meaningful_arg 测试 =====
+
+    #[test]
+    fn meaningful_arg_detection() {
+        assert!(is_meaningful_arg("--port=5173", "node"));
+        assert!(is_meaningful_arg("--server.port=8080", "java"));
+        assert!(is_meaningful_arg("dev", "node"));
+        assert!(!is_meaningful_arg("some-random-arg", "node"));
+        assert!(!is_meaningful_arg("D:\\path\\to\\file", "node"));
     }
 }

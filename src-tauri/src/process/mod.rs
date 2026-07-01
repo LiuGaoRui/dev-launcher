@@ -8,6 +8,7 @@
 //! - `monitor`：监控探测（CPU/内存/端口，阶段 5）
 //! - `build`：构建执行（后台跑完，stdout/stderr 重定向到 build.log）
 //! - `kill`：进程树终止公共封装（taskkill /F /T）
+//! - `trim`：进程内存回收（修剪工作集，不杀进程）
 //! - `dev_scan`：全系统开发进程扫描 + 智能分类（内存清理器用）
 
 pub mod build;
@@ -18,6 +19,7 @@ pub mod monitor;
 pub mod registry;
 pub mod spawn;
 pub mod tree;
+pub mod trim;
 
 pub use registry::ProcessRegistry;
 

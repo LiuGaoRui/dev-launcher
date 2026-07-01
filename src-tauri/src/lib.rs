@@ -66,6 +66,7 @@ pub fn run() {
             // cleaner（内存清理器）
             commands::cleaner::scan_dev_processes,
             commands::cleaner::kill_dev_processes,
+            commands::cleaner::trim_dev_processes,
             commands::cleaner::get_system_memory,
         ])
         .run(tauri::generate_context!())

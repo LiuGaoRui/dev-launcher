@@ -1,14 +1,16 @@
 <script setup lang="ts">
-// 内存清理抽屉 —— 全系统开发进程扫描 + 智能推荐 + 批量/单独清理。
+// 内存清理抽屉 —— 全系统开发进程扫描 + 智能推荐 + 杀进程/回收内存。
 //
 // 布局（NDrawer, 右侧 640px）：
 //   顶部：系统内存概览条 + 推荐清理摘要
-//   工具栏：全选推荐 / 一键清理推荐 / 刷新 / 搜索框
-//   进程列表：复选框 + 类型图标 + 项目提示/命令行 + 内存(整树) + 分类标签 + 单独「杀」
-//   底部：已选统计 + 清理按钮
+//   工具栏：一键回收全部 / 全选推荐 / 一键清理推荐 / 刷新 / 搜索框
+//   进程列表：复选框 + 类型图标 + 项目提示/命令行 + 内存(整树) + 分类标签 + 行内「回收」/「杀」
+//   底部：已选统计 + 回收选中 + 清理选中
 //
-// 智能推荐：孤立进程、高内存构建 daemon / dev server（后端 dev_scan 判定）。
-// 安全：IDE 进程受保护不可选中、不可清理；所有清理需用户点击确认。
+// 两个正交动作：
+//   - 杀（trash）：终止进程树，进程消失——用于孤立残留、泄漏的 dev server
+//   - 回收（water）：修剪工作集换出冷页，进程继续跑——用于 IDE 内存回收
+// IDE 进程不可杀（受保护），但可回收。
 
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import {
@@ -30,6 +32,9 @@ import {
   ServerOutline,
   CloseCircle,
   LayersOutline,
+  WaterOutline,
+  LockClosedOutline,
+  LockOpenOutline,
 } from '@vicons/ionicons5'
 import { useCleanerStore } from '@/stores/cleaner'
 import { CATEGORY_META, type DevProcInfo } from '@/types/cleaner'
@@ -51,7 +56,13 @@ const filteredProcesses = computed<DevProcInfo[]>(() => {
   if (!kw) return cleanerStore.processes
   return cleanerStore.processes.filter((p) => {
     return (
+      p.display_title.toLowerCase().includes(kw) ||
       p.cmdline_hint.toLowerCase().includes(kw) ||
+      p.project_path.toLowerCase().includes(kw) ||
+      p.cmdline_summary.toLowerCase().includes(kw) ||
+      p.main_script.toLowerCase().includes(kw) ||
+      (p.cwd ?? '').toLowerCase().includes(kw) ||
+      p.exe.toLowerCase().includes(kw) ||
       p.cmdline.toLowerCase().includes(kw) ||
       p.name.toLowerCase().includes(kw) ||
       String(p.pid) === kw
@@ -95,6 +106,68 @@ onBeforeUnmount(() => {
 })
 
 // ===== 清理操作 =====
+
+/** 一键回收全部开发进程的内存（修剪工作集，不杀进程，含 IDE） */
+async function handleTrimAll() {
+  if (cleanerStore.processes.length === 0) {
+    message.info('暂无可回收的进程')
+    return
+  }
+  const count = cleanerStore.processes.length
+  const totalMem = cleanerStore.totalProcessMemory
+  dialog.info({
+    title: '一键回收内存',
+    content: `将对 ${count} 个开发进程（含 IDE）修剪工作集，当前合计占用 ${formatBytes(totalMem)}。进程不会终止，只是换出不活跃内存页。`,
+    positiveText: '回收',
+    negativeText: '取消',
+    onPositiveClick: async () => {
+      const [result, err] = await cleanerStore.trimAll()
+      if (err) {
+        message.error(`回收失败：${err}`)
+        return
+      }
+      if (result) {
+        const freed = formatBytes(result.freed_bytes)
+        if (result.failed > 0) {
+          message.warning(`已回收 ${result.trimmed} 项（释放 ${freed}），${result.failed} 项失败`)
+        } else {
+          message.success(`已回收 ${result.trimmed} 项，释放 ${freed} 内存`)
+        }
+      }
+    },
+  })
+}
+
+/** 回收已选中进程的内存 */
+async function handleTrimSelected() {
+  const selectedCount = cleanerStore.selectedPidTrees.length
+  if (selectedCount === 0) {
+    message.warning('请先选择要回收的进程')
+    return
+  }
+  const [result, err] = await cleanerStore.trimSelected()
+  if (err) {
+    message.error(`回收失败：${err}`)
+    return
+  }
+  if (result) {
+    const freed = formatBytes(result.freed_bytes)
+    message.success(`已回收 ${result.trimmed} 项，释放 ${freed} 内存`)
+  }
+}
+
+/** 回收单个进程的内存（行内「回收」按钮） */
+async function handleTrimOne(p: DevProcInfo) {
+  const [result, err] = await cleanerStore.trimOne(p)
+  if (err) {
+    message.error(`回收失败：${err}`)
+    return
+  }
+  if (result) {
+    const freed = formatBytes(result.freed_bytes)
+    message.success(`已回收，释放 ${freed} 内存`)
+  }
+}
 
 async function handleKillSelected() {
   if (cleanerStore.selectedPidTrees.length === 0) {
@@ -209,6 +282,17 @@ async function handleKillRecommended() {
         <div class="toolbar-left">
           <NButton
             size="small"
+            type="primary"
+            secondary
+            :disabled="cleanerStore.processes.length === 0 || cleanerStore.trimming"
+            :loading="cleanerStore.trimming"
+            @click="handleTrimAll"
+          >
+            <template #icon><NIcon><WaterOutline /></NIcon></template>
+            一键回收全部
+          </NButton>
+          <NButton
+            size="small"
             type="warning"
             secondary
             :disabled="cleanerStore.recommendedPids.length === 0 || cleanerStore.killing"
@@ -232,7 +316,7 @@ async function handleKillRecommended() {
         <NInput
           v-model:value="keyword"
           size="small"
-          placeholder="搜索进程 / 命令行 / PID"
+          placeholder="搜索名称 / 路径 / PID"
           clearable
           style="width: 200px"
         >
@@ -258,15 +342,16 @@ async function handleKillRecommended() {
             :class="{
               'proc-row--recommended': p.recommended,
               'proc-row--protected': cleanerStore.isProtected(p),
+              'proc-row--locked': cleanerStore.isLocked(p),
               'proc-row--selected': cleanerStore.selectedPids.has(p.pid),
             }"
           >
-            <!-- 复选框 -->
-            <label class="proc-check" :class="{ 'proc-check--disabled': cleanerStore.isProtected(p) }">
+            <!-- 复选框（锁定/保护 时禁用） -->
+            <label class="proc-check" :class="{ 'proc-check--disabled': !cleanerStore.isActionable(p) }">
               <input
                 type="checkbox"
                 :checked="cleanerStore.selectedPids.has(p.pid)"
-                :disabled="cleanerStore.isProtected(p)"
+                :disabled="!cleanerStore.isActionable(p)"
                 @change="cleanerStore.toggleSelect(p.pid)"
               />
             </label>
@@ -274,10 +359,10 @@ async function handleKillRecommended() {
             <!-- 类型图标 -->
             <span class="proc-kind">{{ kindIcon(p.kind) }}</span>
 
-            <!-- 项目提示 + 命令行 -->
+            <!-- 展示名 + 项目路径 + 命令摘要 + 工作目录 -->
             <div class="proc-main">
-              <div class="proc-hint-row">
-                <span class="proc-hint" :title="p.cmdline_hint">{{ p.cmdline_hint || p.name }}</span>
+              <div class="proc-title-row">
+                <span class="proc-title" :title="p.display_title">{{ p.display_title || p.name }}</span>
                 <NTag
                   size="tiny"
                   round
@@ -286,9 +371,24 @@ async function handleKillRecommended() {
                 >
                   {{ catMeta(p).label }}
                 </NTag>
+                <span v-if="cleanerStore.isLocked(p)" class="lock-badge">已锁定</span>
                 <span v-if="p.recommended" class="rec-badge">推荐</span>
               </div>
-              <div class="proc-cmdline" :title="p.cmdline">{{ p.cmdline }}</div>
+              <!-- 项目路径 -->
+              <div v-if="p.project_path" class="proc-path" :title="`项目路径: ${p.project_path}`">
+                <span class="proc-path-prefix">📁</span>{{ p.project_path }}
+              </div>
+              <!-- 命令行摘要（正在执行什么） -->
+              <div v-if="p.cmdline_summary" class="proc-summary" :title="`完整命令行: ${p.cmdline}`">
+                <span class="proc-summary-prefix">💻</span>{{ p.cmdline_summary }}
+              </div>
+              <!-- 工作目录 + PID -->
+              <div class="proc-meta">
+                <span v-if="p.cwd" class="proc-cwd" :title="`工作目录: ${p.cwd}`">
+                  📂 {{ p.cwd }}
+                </span>
+                <span class="proc-pid">PID {{ p.pid }}</span>
+              </div>
             </div>
 
             <!-- 内存 -->
@@ -297,14 +397,37 @@ async function handleKillRecommended() {
               <span class="proc-mem-cpu">CPU {{ p.cpu_percent.toFixed(1) }}%</span>
             </div>
 
-            <!-- 单独杀按钮 -->
+            <!-- 单独回收按钮（锁定时禁用） -->
             <button
-              class="proc-kill-btn"
-              :disabled="cleanerStore.isProtected(p) || cleanerStore.killing"
-              :title="cleanerStore.isProtected(p) ? '受保护的 IDE 进程' : '终止此进程树'"
+              class="proc-action-btn proc-trim-btn"
+              :disabled="cleanerStore.isLocked(p) || cleanerStore.trimming"
+              :title="cleanerStore.isLocked(p) ? '已锁定，不可回收' : '回收内存（修剪工作集，不终止进程）'"
+              @click.stop="handleTrimOne(p)"
+            >
+              <NIcon size="14"><WaterOutline /></NIcon>
+            </button>
+
+            <!-- 单独杀按钮（锁定/IDE 保护禁用） -->
+            <button
+              class="proc-action-btn proc-kill-btn"
+              :disabled="!cleanerStore.isActionable(p) || cleanerStore.killing"
+              :title="cleanerStore.isLocked(p) ? '已锁定，不可终止' : cleanerStore.isProtected(p) ? '受保护的 IDE 进程不可终止' : '终止此进程树'"
               @click.stop="handleKillOne(p)"
             >
               <NIcon size="14"><CloseCircle /></NIcon>
+            </button>
+
+            <!-- 锁定/解锁按钮 -->
+            <button
+              class="proc-action-btn proc-lock-btn"
+              :class="{ 'proc-lock-btn--locked': cleanerStore.isLocked(p) }"
+              :title="cleanerStore.isLocked(p) ? '点击解锁' : '锁定（锁定后不可清理和回收）'"
+              @click.stop="cleanerStore.toggleLock(p.pid)"
+            >
+              <NIcon size="14">
+                <LockClosedOutline v-if="cleanerStore.isLocked(p)" />
+                <LockOpenOutline v-else />
+              </NIcon>
             </button>
           </div>
         </div>
@@ -321,6 +444,17 @@ async function handleKillRecommended() {
           <div class="footer-actions">
             <NButton size="small" quaternary :disabled="cleanerStore.selectedPidTrees.length === 0" @click="cleanerStore.clearSelection()">
               清空选择
+            </NButton>
+            <NButton
+              size="small"
+              type="primary"
+              secondary
+              :disabled="cleanerStore.selectedPidTrees.length === 0 || cleanerStore.trimming"
+              :loading="cleanerStore.trimming"
+              @click="handleTrimSelected"
+            >
+              <template #icon><NIcon><WaterOutline /></NIcon></template>
+              回收选中
             </NButton>
             <NButton
               size="small"
@@ -498,28 +632,72 @@ async function handleKillRecommended() {
   flex: 1;
   min-width: 0;
 }
-.proc-hint-row {
+.proc-title-row {
   display: flex;
   align-items: center;
   gap: 6px;
 }
-.proc-hint {
+.proc-title {
   font-size: 12.5px;
-  font-weight: 500;
+  font-weight: 600;
   color: var(--text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 180px;
+  max-width: 220px;
 }
-.proc-cmdline {
+.proc-path {
   font-size: 10.5px;
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
   font-family: var(--code-font);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   margin-top: 2px;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+.proc-path-prefix {
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+.proc-summary {
+  font-size: 10.5px;
+  color: var(--text-secondary);
+  font-family: var(--code-font);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-top: 1px;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+.proc-summary-prefix {
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+.proc-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 1px;
+}
+.proc-cwd {
+  font-size: 9.5px;
+  color: var(--text-tertiary);
+  font-family: var(--code-font);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 240px;
+}
+.proc-pid {
+  font-size: 9.5px;
+  color: var(--text-tertiary);
+  font-family: var(--code-font);
+  flex-shrink: 0;
 }
 .rec-badge {
   font-size: 9.5px;
@@ -552,8 +730,8 @@ async function handleKillRecommended() {
   font-family: var(--code-font);
 }
 
-/* 单独杀按钮 */
-.proc-kill-btn {
+/* 操作按钮基类（回收/杀/锁定 共享） */
+.proc-action-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -566,13 +744,50 @@ async function handleKillRecommended() {
   flex-shrink: 0;
   transition: background 0.12s, color 0.12s;
 }
+.proc-action-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+/* 回收按钮（修剪工作集，蓝色系） */
+.proc-trim-btn:hover:not(:disabled) {
+  background: var(--status-running-soft);
+  color: var(--accent);
+}
+
+/* 杀按钮（红色系） */
 .proc-kill-btn:hover:not(:disabled) {
   background: var(--status-warning-soft);
   color: var(--status-warning);
 }
-.proc-kill-btn:disabled {
-  cursor: not-allowed;
-  opacity: 0.4;
+
+/* 锁定按钮 */
+.proc-lock-btn:hover {
+  background: var(--card-hover-bg);
+  color: var(--text-secondary);
+}
+/* 已锁定状态：图标高亮 */
+.proc-lock-btn--locked {
+  color: #722ed1;
+}
+.proc-lock-btn--locked:hover {
+  background: rgba(114, 46, 209, 0.12);
+  color: #722ed1;
+}
+
+/* 锁定行视觉区分 */
+.proc-row--locked {
+  border-left: 3px solid #722ed1;
+}
+/* 锁定角标 */
+.lock-badge {
+  font-size: 9.5px;
+  background: #722ed1;
+  color: #fff;
+  padding: 0 5px;
+  border-radius: 3px;
+  line-height: 14px;
+  flex-shrink: 0;
 }
 
 /* 底部 */

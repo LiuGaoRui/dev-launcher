@@ -48,11 +48,13 @@ tempfile = "3"
 # - Win32_Foundation: HANDLE / CloseHandle
 # - Win32_Security: CreateJobObjectW 的 SECURITY_ATTRIBUTES 参数（即便传 None 也需此 feature）
 # - Win32_System_JobObjects: Job Object 全套 API
+# - Win32_System_Memory: SetProcessWorkingSetSizeEx（修剪工作集）
 # - Win32_System_Threading: OpenProcess / IO_COUNTERS / PROCESS_ACCESS_RIGHTS
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_JobObjects",
+    "Win32_System_Memory",
     "Win32_System_Threading",
 ] }
 

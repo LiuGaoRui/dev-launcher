@@ -48,6 +48,16 @@ export interface DevProcInfo {
   cmdline: string
   /** 从命令行提取的项目/模块提示 */
   cmdline_hint: string
+  /** 用户友好的展示名（如「IntelliJ IDEA」「VSCode 扩展宿主」「vite dev server」） */
+  display_title: string
+  /** 关联的项目/工作目录路径（帮助判断是哪个项目的进程），可能为空 */
+  project_path: string
+  /** 进程工作目录（OS 报告的真实 cwd），可能为 null（权限不足或已退出） */
+  cwd: string | null
+  /** 命令行语义化摘要：提取主脚本 + 关键参数，比 exe 路径更能说明「在做什么」 */
+  cmdline_summary: string
+  /** 正在执行的主程序名（如 server.js / Application / demo.jar），用于快速辨识 */
+  main_script: string
   /** 本进程 RSS（字节） */
   memory_bytes: number
   /** 整个进程树内存（含子进程，字节） */
@@ -71,6 +81,16 @@ export interface KillResult {
   /** 杀失败的进程树数量 */
   failed: number
   /** 杀死前这些进程树的内存总和（字节） */
+  freed_bytes: number
+}
+
+/** 批量修剪工作集（内存回收，不杀进程）的结果（对齐 Rust `TrimResult`） */
+export interface TrimResult {
+  /** 成功修剪的进程数量 */
+  trimmed: number
+  /** 修剪失败的进程数量（权限不足或进程已退出） */
+  failed: number
+  /** 回收的物理内存总量（字节，回收前后 RSS 差值之和） */
   freed_bytes: number
 }
 
