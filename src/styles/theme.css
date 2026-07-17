@@ -44,6 +44,10 @@
   --status-warning-soft: rgba(250, 173, 20, 0.14);
   --status-stopped-soft: rgba(191, 191, 191, 0.14);
 
+  /* ---- 目录分组标题栏背景色（同目录同色，FNV-1a 哈希分配色相） ---- */
+  --group-head-sat: 68%;
+  --group-head-light: 94%;
+
   /* ---- 终端日志区 ---- */
   --terminal-bg: #1e1e1e;
   --terminal-fg: #d4d4d4;
@@ -94,6 +98,9 @@
   --status-running-soft: rgba(82, 196, 26, 0.18);
   --status-warning-soft: rgba(250, 173, 20, 0.2);
   --status-stopped-soft: rgba(120, 120, 120, 0.2);
+
+  --group-head-sat: 42%;
+  --group-head-light: 26%;
 
   --terminal-bg: #0d0d0d;
   --terminal-fg: #d4d4d4;

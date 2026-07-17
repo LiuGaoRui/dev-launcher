@@ -30,6 +30,8 @@ const props = defineProps<{
   dragging?: boolean
   /** 作为拖拽放置目标——高亮边框视觉态 */
   dragOver?: boolean
+  /** 所属目录的色相（HSL hue），用于标题栏背景着色区分不同 scan_root */
+  groupHue?: number
 }>()
 
 const emit = defineEmits<{
@@ -87,8 +89,8 @@ function urlOf(port: string): string {
     draggable="true"
     :data-project-id="props.project.id"
   >
-    <!-- 头部：图标 + 名称 + 类型标签 + 状态 -->
-    <div class="card-head">
+    <!-- 头部：图标 + 名称 + 类型标签 + 状态（标题栏背景色 = 所属目录色） -->
+    <div class="card-head" :style="{ '--group-hue': props.groupHue ?? 210 }">
       <NIcon class="type-icon" size="16">
         <CubeOutline />
       </NIcon>
@@ -206,12 +208,21 @@ function urlOf(port: string): string {
   box-shadow: 0 0 0 2px var(--accent);
 }
 
-/* 头部 */
+/* 头部（标题栏：背景色标识所属 scan_root 目录，同目录同色） */
 .card-head {
   display: flex;
   align-items: center;
   gap: 8px;
   min-width: 0;
+  padding: 6px 10px;
+  margin: 0 -2px;
+  border-radius: 4px;
+  background: hsl(var(--group-hue, 210), var(--group-head-sat, 68%), var(--group-head-light, 94%));
+  transition: background 0.12s, filter 0.12s;
+}
+/* hover 时标题栏色块跟随卡片身做轻微明度变化，避免分层感 */
+.project-card:hover .card-head {
+  filter: brightness(1.03);
 }
 .type-icon {
   color: var(--accent);
@@ -222,10 +233,11 @@ function urlOf(port: string): string {
   font-weight: 600;
   color: var(--text-primary);
   max-width: 180px;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  flex-shrink: 0;
+  flex: 0 1 auto;
 }
 .status-badge {
   margin-left: auto;

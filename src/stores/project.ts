@@ -20,7 +20,6 @@ import {
 } from '@/api/project'
 import { startProject, stopProject } from '@/api/process'
 import { probeStatuses } from '@/api/monitor'
-import { listScanRootOrder, reorderScanRoots } from '@/api/scan_root'
 import type { Project, ProjectInput } from '@/types/project'
 import type { HealthStatus, ProjectStatus } from '@/types/monitor'
 import { safeCall } from '@/api/invoke'
@@ -35,9 +34,6 @@ export const useProjectStore = defineStore('project', () => {
   /** 运行中项目的探测结果：project_id → ProjectStatus。不在表中的 id 视为 stopped。 */
   const statuses = ref<Record<number, ProjectStatus>>({})
 
-  /** 扫描目录（面板）的排序记录：scan_root → sort_order。未记录的目录前端按字母序兜底。 */
-  const scanRootOrder = ref<Record<string, number>>({})
-
   /** 防止并发 probe（上一轮未完成时跳过） */
   let probing = false
 
@@ -49,20 +45,16 @@ export const useProjectStore = defineStore('project', () => {
     }
   }
 
-  /** 拉取项目列表 + 扫描目录排序 */
+  /** 拉取项目列表 */
   async function fetchAll() {
     loading.value = true
     try {
-      const [list, order] = await Promise.all([
-        listProjects(),
-        listScanRootOrder(),
-      ])
-      // 预 trim scan_root，避免 panels computed 每次重算都 trim
+      const list = await listProjects()
+      // 预 trim scan_root，避免后续每次重算都 trim
       for (const p of list) {
         if (p.scan_root) p.scan_root = p.scan_root.trim() || null
       }
       projects.value = list
-      scanRootOrder.value = order
     } finally {
       loading.value = false
     }
@@ -157,7 +149,7 @@ export const useProjectStore = defineStore('project', () => {
 
   /**
    * 重排项目顺序：先持久化到 DB，再本地重排 projects 数组。
-   * @param ids 新顺序下的项目 id 数组（仅含被拖动面板内的项目）
+   * @param ids 新顺序下的项目 id 数组（下标即新 sort_order）
    */
   async function reorderProjectsOrder(ids: number[]) {
     await reorderProjects(ids)
@@ -174,22 +166,10 @@ export const useProjectStore = defineStore('project', () => {
     })
   }
 
-  /**
-   * 重排扫描目录（面板）顺序：先持久化到 DB，再更新本地 scanRootOrder 缓存。
-   * @param roots 新顺序下的扫描目录路径数组
-   */
-  async function reorderScanRootsOrder(roots: string[]) {
-    await reorderScanRoots(roots)
-    const map: Record<string, number> = {}
-    roots.forEach((r, i) => (map[r] = i))
-    scanRootOrder.value = map
-  }
-
   return {
     projects,
     loading,
     statuses,
-    scanRootOrder,
     fetchAll,
     add,
     patch,
@@ -205,6 +185,5 @@ export const useProjectStore = defineStore('project', () => {
     totalCount,
     safe,
     reorderProjectsOrder,
-    reorderScanRootsOrder,
   }
 })

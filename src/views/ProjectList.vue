@@ -1,14 +1,14 @@
 <script setup lang="ts">
 // 项目列表页 —— 阶段 3 核心 UI。
 //
-// 布局：顶部工具栏 + 按「扫描目录」分组的程序面板。
-//   每个扫描目录一个面板标题头（显示扫描目录路径 + 项目数），下方放该目录扫描出的程序卡片。
-//   手动添加、无 scan_root 的项目归入「其他」面板。
+// 布局：顶部工具栏 + 扁平卡片网格（所有目录的项目按顺序排列在同一网格）。
+//   同一 scan_root 目录的卡片标题栏使用相同背景色，不同目录不同色，以视觉区分。
+//   目录→色相 用 FNV-1a 哈希稳定绑定，拖拽改变顺序或新增目录都不影响已有目录颜色。
 // 能力：新建/编辑/删除项目、启动/停止、构建（后台）、日志、点击访问链接用默认浏览器打开。
-// 排序：面板标题头可拖拽调整扫描目录顺序（持久化）；卡片可在同面板内拖拽排序（持久化）。
+// 排序：卡片可跨目录任意拖拽排序（持久化全局 sort_order）。
 // 编排：所有 store 操作在本页面集中进行，卡片组件无状态。
 
-import { computed, onActivated, onDeactivated, onMounted, reactive, ref } from 'vue'
+import { onActivated, onDeactivated, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { NButton, NEmpty, NSpin, useMessage, useDialog } from 'naive-ui'
 import { useProjectStore } from '@/stores/project'
@@ -28,154 +28,40 @@ const router = useRouter()
 const message = useMessage()
 const dialog = useDialog()
 
-// ===== 按扫描目录分组 =====
-
-/** 单个面板的数据：一个扫描目录下的全部项目 */
-interface Panel {
-  /** 分组键（scan_root，或 '__other__' 表示无扫描目录的项目） */
-  key: string
-  /** 面板标题展示文本（扫描目录路径，或「其他」） */
-  title: string
-  /** 是否「其他」分组（无 scan_root） */
-  isOther: boolean
-  /** 该面板下的项目 */
-  projects: Project[]
-}
-
-/**
- * 按 scan_root 把项目聚合为面板列表。
- *
- * - 有 scan_root 的项目按目录聚合
- * - 面板排序：优先按 store.scanRootOrder（用户拖拽过的顺序），
- *   未记录的目录按字典序兜底排到已记录目录之后
- * - 无 scan_root 的项目统一归入「其他」面板，恒在末尾
- * - 面板内项目按 sort_order ASC 排序（后端已排好，此处保持稳定）
- */
-const panels = computed<Panel[]>(() => {
-  const map = new Map<string, Project[]>()
-  const others: Project[] = []
-  for (const p of projectStore.projects) {
-    const root = p.scan_root
-    if (root) {
-      const arr = map.get(root)
-      if (arr) arr.push(p)
-      else map.set(root, [p])
-    } else {
-      others.push(p)
-    }
-  }
-
-  // 有 scan_root 的面板：先按 scanRootOrder 排序，未记录的按字典序兜底
-  const order = projectStore.scanRootOrder
-  const sortedRoots = Array.from(map.keys()).sort((a, b) => {
-    const oa = order[a]
-    const ob = order[b]
-    // 两者都有记录 → 按 sort_order
-    if (oa !== undefined && ob !== undefined) return oa - ob
-    // 仅 a 有记录 → a 在前
-    if (oa !== undefined) return -1
-    // 仅 b 有记录 → b 在前
-    if (ob !== undefined) return 1
-    // 都无记录 → 按字典序
-    return a.localeCompare(b, 'zh')
-  })
-
-  const panels: Panel[] = sortedRoots.map((root) => ({
-    key: root,
-    title: root,
-    isOther: false,
-    projects: map.get(root)!,
-  }))
-  // 「其他」面板放最后
-  if (others.length) {
-    panels.push({
-      key: '__other__',
-      title: '其他',
-      isOther: true,
-      projects: others,
-    })
-  }
-  return panels
-})
-
-// ===== 拖拽排序状态 =====
+// ===== 目录色（同 scan_root 同色） =====
 //
-// 两类拖拽共享一套状态：拖动源 + 放置高亮目标。
-// dragKind 区分当前是「面板」还是「卡片」拖拽，避免误判。
-
-type DragKind = 'panel' | 'card'
-const dragKind = ref<DragKind | null>(null)
-/** 拖动源：面板 key（面板拖拽）或项目 id（卡片拖拽） */
-const dragSource = ref<string | number | null>(null)
-/** 当前被高亮的放置目标 key（面板拖拽）或项目 id（卡片拖拽） */
-const dragOverTarget = ref<string | number | null>(null)
-
-/** 判断某卡片是否处于拖动中（半透明视觉态） */
-function isCardDragging(id: number): boolean {
-  return dragKind.value === 'card' && dragSource.value === id
-}
-/** 判断某卡片是否为放置目标（高亮边框） */
-function isCardDragOver(id: number): boolean {
-  return dragKind.value === 'card' && dragOverTarget.value === id
-}
-/** 判断某面板标题头是否处于拖动中 */
-function isPanelDragging(key: string): boolean {
-  return dragKind.value === 'panel' && dragSource.value === key
-}
-/** 判断某面板是否为放置目标 */
-function isPanelDragOver(key: string): boolean {
-  return dragKind.value === 'panel' && dragOverTarget.value === key
-}
-
-// ===== 面板拖拽（调整扫描目录顺序） =====
-
-function onPanelDragStart(e: DragEvent, key: string) {
-  dragKind.value = 'panel'
-  dragSource.value = key
-  if (e.dataTransfer) {
-    e.dataTransfer.effectAllowed = 'move'
-    // 必须 setData 否部分浏览器不触发 dragover
-    e.dataTransfer.setData('text/plain', `panel:${key}`)
+// 剔除 0(红)/340(粉) 等与运行状态色（绿/橙/灰）、错误色语义冲突的色相。
+// 用 FNV-1a 对 scan_root 字符串哈希后取下标，保证「目录→色相」稳定绑定：
+// 拖拽改变顺序、新增/删除其他目录都不影响本目录的颜色。
+const HUES = [210, 28, 145, 270, 190, 50, 310, 95, 230, 125]
+function hueOf(root: string | null): number {
+  const s = root ?? '__other__'
+  let h = 2166136261
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i)
+    h = Math.imul(h, 16777619)
   }
+  return HUES[Math.abs(h) % HUES.length]
 }
 
-function onPanelDragOver(e: DragEvent, key: string) {
-  if (dragKind.value !== 'panel') return
-  e.preventDefault()
-  if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
-  if (dragSource.value !== key) dragOverTarget.value = key
-}
-
-async function onPanelDrop(e: DragEvent, targetKey: string) {
-  e.preventDefault()
-  e.stopPropagation()
-  if (dragKind.value !== 'panel' || dragSource.value === null) {
-    resetDrag()
-    return
-  }
-  const sourceKey = dragSource.value as string
-  if (sourceKey !== targetKey) {
-    await reorderPanels(sourceKey, targetKey)
-  }
-  resetDrag()
-}
-
-/** 把源面板移到目标面板的位置（其余顺延） */
-async function reorderPanels(sourceKey: string, targetKey: string) {
-  // 「其他」面板不可拖拽也不作为持久化目标（它无 scan_root）
-  if (sourceKey === '__other__' || targetKey === '__other__') return
-  const keys = panels.value.filter((p) => !p.isOther).map((p) => p.key)
-  if (!moveInArray(keys, keys.indexOf(sourceKey), keys.indexOf(targetKey))) return
-  const [, err] = await projectStore.safe(() =>
-    projectStore.reorderScanRootsOrder(keys),
-  )
-  if (err) message.error(`调整顺序失败：${err}`)
-}
-
-// ===== 卡片拖拽（同面板内排序） =====
+// ===== 卡片拖拽排序（跨目录任意排序） =====
 //
 // 卡片根元素自带 draggable + data-project-id（见 ProjectCard.vue），
 // 这里用事件委托在 grid 容器上监听 drag 事件，解析 data-project-id。
+
+/** 拖动源：项目 id */
+const dragSource = ref<number | null>(null)
+/** 当前被高亮的放置目标 id */
+const dragOverTarget = ref<number | null>(null)
+
+/** 判断某卡片是否处于拖动中（半透明视觉态） */
+function isCardDragging(id: number): boolean {
+  return dragSource.value === id
+}
+/** 判断某卡片是否为放置目标（高亮边框） */
+function isCardDragOver(id: number): boolean {
+  return dragOverTarget.value === id
+}
 
 /** 从拖拽事件目标向上找最近的卡片，取其 data-project-id */
 function cardIdFromEvent(e: DragEvent): number | null {
@@ -186,7 +72,6 @@ function cardIdFromEvent(e: DragEvent): number | null {
 }
 
 function onCardDragStart(e: DragEvent, projectId: number) {
-  dragKind.value = 'card'
   dragSource.value = projectId
   if (e.dataTransfer) {
     e.dataTransfer.effectAllowed = 'move'
@@ -195,22 +80,21 @@ function onCardDragStart(e: DragEvent, projectId: number) {
 }
 
 function onCardDragOver(e: DragEvent, projectId: number) {
-  if (dragKind.value !== 'card') return
   e.preventDefault()
   if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
   if (dragSource.value !== projectId) dragOverTarget.value = projectId
 }
 
-async function onCardDrop(e: DragEvent, panel: Panel, targetId: number) {
+async function onCardDrop(e: DragEvent, targetId: number) {
   e.preventDefault()
   e.stopPropagation()
-  if (dragKind.value !== 'card' || dragSource.value === null) {
+  if (dragSource.value === null) {
     resetDrag()
     return
   }
-  const sourceId = dragSource.value as number
+  const sourceId = dragSource.value
   if (sourceId !== targetId) {
-    await reorderCardsInPanel(panel, sourceId, targetId)
+    await reorderCards(sourceId, targetId)
   }
   resetDrag()
 }
@@ -229,32 +113,25 @@ function onGridDragOver(e: DragEvent) {
   onCardDragOver(e, id)
 }
 
-function onGridDrop(e: DragEvent, panel: Panel) {
+function onGridDrop(e: DragEvent) {
   const id = cardIdFromEvent(e)
   if (id === null) {
     resetDrag()
     return
   }
-  onCardDrop(e, panel, id)
+  onCardDrop(e, id)
 }
 
-/** 把源卡片移到目标卡片位置（同面板内），其余顺延，并持久化新顺序 */
-async function reorderCardsInPanel(
-  panel: Panel,
-  sourceId: number,
-  targetId: number,
-) {
-  const ids = panel.projects.map((p) => p.id)
+/** 把源卡片移到目标卡片位置（全局重排），其余顺延，并持久化新顺序 */
+async function reorderCards(sourceId: number, targetId: number) {
+  const ids = projectStore.projects.map((p) => p.id)
   if (!moveInArray(ids, ids.indexOf(sourceId), ids.indexOf(targetId))) return
-  const [, err] = await projectStore.safe(() =>
-    projectStore.reorderProjectsOrder(ids),
-  )
+  const [, err] = await projectStore.safe(() => projectStore.reorderProjectsOrder(ids))
   if (err) message.error(`调整顺序失败：${err}`)
 }
 
 /** 拖拽结束 / 离开：清空状态 */
 function resetDrag() {
-  dragKind.value = null
   dragSource.value = null
   dragOverTarget.value = null
 }
@@ -432,63 +309,37 @@ async function stopAll() {
       </div>
     </div>
 
-    <!-- 按扫描目录分组的面板 -->
+    <!-- 扁平卡片网格（所有目录的项目按顺序排列，同目录同色） -->
     <div v-if="projectStore.loading" class="grid-loading">
       <NSpin size="small" />
     </div>
 
-    <div v-else-if="panels.length" class="panels">
-      <section
-        v-for="panel in panels"
-        :key="panel.key"
-        class="panel"
-      >
-        <!-- 面板标题头（可拖拽调整扫描目录顺序；「其他」面板不可拖） -->
-        <header
-          class="panel-head"
-          :class="{
-            'panel-head--other': panel.isOther,
-            'panel-dragging': isPanelDragging(panel.key),
-            'panel-drag-over': isPanelDragOver(panel.key),
-          }"
-          :draggable="!panel.isOther"
-          @dragstart="onPanelDragStart($event, panel.key)"
-          @dragover="onPanelDragOver($event, panel.key)"
-          @drop="onPanelDrop($event, panel.key)"
-          @dragend="onDragEnd"
-        >
-          <span class="drag-handle" :title="panel.isOther ? '' : '拖拽调整顺序'">⠿</span>
-          <span class="panel-title" :title="panel.title">{{ panel.title }}</span>
-          <span class="panel-count">{{ panel.projects.length }}</span>
-        </header>
-
-        <!-- 该目录下的程序卡片（拖拽事件委托到 grid 容器） -->
-        <div
-          class="grid"
-          @dragstart="onGridDragStart($event)"
-          @dragover="onGridDragOver($event)"
-          @drop="onGridDrop($event, panel)"
-          @dragend="onDragEnd"
-        >
-          <ProjectCard
-            v-for="p in panel.projects"
-            :key="p.id"
-            :project="p"
-            :status="projectStore.statuses[p.id] ?? null"
-            :busy="busyIds.has(p.id)"
-            :build-state="buildStore.getState(p.id)"
-            :dragging="isCardDragging(p.id)"
-            :drag-over="isCardDragOver(p.id)"
-            @start="handleStart(p)"
-            @stop="handleStop(p)"
-            @build="handleBuild(p)"
-            @log="handleLog(p)"
-            @edit="openEdit(p)"
-            @delete="handleDelete(p)"
-            @open-url="handleOpenUrl"
-          />
-        </div>
-      </section>
+    <div
+      v-else-if="projectStore.projects.length"
+      class="grid"
+      @dragstart="onGridDragStart($event)"
+      @dragover="onGridDragOver($event)"
+      @drop="onGridDrop($event)"
+      @dragend="onDragEnd"
+    >
+      <ProjectCard
+        v-for="p in projectStore.projects"
+        :key="p.id"
+        :project="p"
+        :status="projectStore.statuses[p.id] ?? null"
+        :busy="busyIds.has(p.id)"
+        :build-state="buildStore.getState(p.id)"
+        :dragging="isCardDragging(p.id)"
+        :drag-over="isCardDragOver(p.id)"
+        :group-hue="hueOf(p.scan_root)"
+        @start="handleStart(p)"
+        @stop="handleStop(p)"
+        @build="handleBuild(p)"
+        @log="handleLog(p)"
+        @edit="openEdit(p)"
+        @delete="handleDelete(p)"
+        @open-url="handleOpenUrl"
+      />
     </div>
 
     <NEmpty
@@ -544,87 +395,16 @@ async function stopAll() {
   align-items: center;
 }
 
-/* 面板滚动容器 */
-.panels {
+/* 卡片网格（1280px 窗口宽度下一行 4 列，窗口缩到 minWidth 960 时降为 3 列） */
+.grid {
   flex: 1;
   min-height: 0;
   overflow: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  padding-right: 4px;
-}
-
-/* 单个面板 */
-.panel {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-/* 面板标题头（可拖拽） */
-.panel-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 4px;
-  border-bottom: 1px solid var(--divider);
-  flex-shrink: 0;
-  user-select: none;
-}
-.panel-head:not(.panel-head--other) {
-  cursor: grab;
-}
-.panel-head:not(.panel-head--other):active {
-  cursor: grabbing;
-}
-.panel-dragging {
-  opacity: 0.45;
-}
-.panel-drag-over {
-  border-bottom-color: var(--accent);
-  background: var(--card-hover-bg);
-}
-.drag-handle {
-  color: var(--text-tertiary);
-  font-size: 14px;
-  line-height: 1;
-  cursor: inherit;
-  opacity: 0.7;
-}
-.panel-head--other .drag-handle {
-  visibility: hidden;
-}
-.panel-title {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-primary);
-  font-family: var(--code-font);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.panel-head--other .panel-title {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
-}
-.panel-count {
-  font-size: 11px;
-  color: var(--text-tertiary);
-  font-family: var(--code-font);
-  background: var(--card-bg);
-  border: 1px solid var(--divider);
-  border-radius: 9px;
-  padding: 0 7px;
-  line-height: 16px;
-  flex-shrink: 0;
-}
-
-/* 卡片网格 */
-.grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
   gap: 12px;
   align-content: start;
+  padding-right: 4px;
 }
 .grid-loading {
   flex: 1;
