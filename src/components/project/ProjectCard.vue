@@ -37,6 +37,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   start: []
   stop: []
+  restart: []
   build: []
   log: []
   edit: []
@@ -153,6 +154,7 @@ function urlOf(port: string): string {
         :build-state="props.buildState"
         @start="emit('start')"
         @stop="emit('stop')"
+        @restart="emit('restart')"
         @build="emit('build')"
         @log="emit('log')"
         @edit="emit('edit')"

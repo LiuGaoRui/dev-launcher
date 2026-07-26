@@ -1,13 +1,15 @@
 <script setup lang="ts">
 // 项目卡片底部的操作条。
-// 按钮：启动/停止 | 构建(+状态图标) | 日志 | 编辑 | 删除
+// 按钮：启动/停止 | 重启 | 构建(+状态图标) | 日志 | 编辑 | 删除
+//
+// 「重启」= 构建 → 停止 → 启动 三步串行（见 ProjectList.handleRestart）。
 //
 // 构建状态图标（由父组件用 buildState prop 传入）：
 //   running → 旋转图标；失败(exit_code!=0 且非 running) → 红色 X；否则无图标。
 
 import { computed } from 'vue'
 import { NButton, NIcon } from 'naive-ui'
-import { RefreshOutline, CloseCircle } from '@vicons/ionicons5'
+import { RefreshOutline, ReloadCircleOutline, CloseCircle } from '@vicons/ionicons5'
 import type { BuildState } from '@/types/project'
 
 const props = defineProps<{
@@ -23,6 +25,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   start: []
   stop: []
+  restart: []
   build: []
   log: []
   edit: []
@@ -64,6 +67,18 @@ const buildFailed = computed(
       size="tiny"
       tertiary
       :disabled="busy || !canBuild || buildRunning"
+      :title="canBuild ? '重新构建并启动（构建 → 停止 → 启动）' : '未配置构建命令'"
+      @click="emit('restart')"
+    >
+      <template #icon>
+        <NIcon><ReloadCircleOutline /></NIcon>
+      </template>
+      重启
+    </NButton>
+    <NButton
+      size="tiny"
+      tertiary
+      :disabled="busy || !canBuild || buildRunning"
       :title="canBuild ? '执行构建命令' : '未配置构建命令'"
       @click="emit('build')"
     >
@@ -79,7 +94,7 @@ const buildFailed = computed(
       </template>
       构建
     </NButton>
-    <NButton size="tiny" tertiary @click="emit('log')">日志</NButton>
+    <NButton size="tiny" tertiary :disabled="busy" @click="emit('log')">日志</NButton>
     <NButton size="tiny" quaternary :disabled="busy" @click="emit('edit')">编辑</NButton>
     <NButton size="tiny" quaternary type="error" :disabled="busy" @click="emit('delete')">
       删除

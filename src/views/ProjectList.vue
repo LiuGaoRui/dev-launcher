@@ -205,6 +205,77 @@ function handleBuild(p: Project) {
   void buildStore.startBuild(p.id)
 }
 
+/**
+ * 点击「重启」：构建 → 停止 → 启动 三步串行。
+ * - 构建必须等待完成（成功才继续），失败则中止（buildStore 已提示，不重复报错）。
+ * - 停止仅在项目运行时执行（已停止则跳过，直接启动）。
+ * - 停止后稍作等待再启动，规避 taskkill 强制杀树后端口释放竞态（启动失败重试一次）。
+ * - 全程用 withBusy 锁定卡片按钮；构建等待带超时兜底，路由切换触发 clearAllTimers 时也不会永久挂起。
+ */
+async function handleRestart(p: Project) {
+  if (!p.build_cmd?.trim()) {
+    message.warning('该项目未配置构建命令，无法重启')
+    return
+  }
+
+  /** 等待构建完成；带超时兜底，避免 buildStore 在路由切换 clearAllTimers 时删除 entry 导致 Promise 永久挂起。 */
+  function waitBuildDone(id: number, timeoutMs = 10 * 60 * 1000): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      let settled = false
+      const done = (exitCode: number) => {
+        if (settled) return
+        settled = true
+        resolve(exitCode === 0)
+      }
+      const timer = setTimeout(() => done(-1), timeoutMs)
+      buildStore.startBuild(id, (exitCode) => {
+        clearTimeout(timer)
+        done(exitCode)
+      })
+    })
+  }
+
+  const [, err] = await withBusy(p.id, async () => {
+    // 1. 构建（等待完成，成功才继续）
+    const buildOk = await waitBuildDone(p.id)
+    if (!buildOk) return false // 构建失败由 buildStore 提示，这里不重复报错
+
+    // 2. 停止（仅当运行中）
+    if (projectStore.isRunning(p.id)) {
+      const [, stopErr] = await projectStore.safe(() => projectStore.stop(p.id))
+      if (stopErr) {
+        message.error(`「${p.name}」重启失败：停止出错 ${stopErr}`)
+        return false
+      }
+    }
+
+    // 3. 启动（端口释放竞态：stop 后稍作等待再启动，失败重试一次）
+    await projectStore.probeNow()
+    let started = false
+    for (let attempt = 0; attempt < 2 && !started; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, 600))
+      const [, startErr] = await projectStore.safe(() => projectStore.start(p.id))
+      if (startErr) {
+        if (attempt === 0) continue // 首次失败，稍后重试一次
+        message.error(`「${p.name}」重启失败：启动出错 ${startErr}`)
+      } else {
+        started = true
+      }
+    }
+    if (!started) return false
+
+    // 4. 确认真正起来，避免过早提示成功
+    await projectStore.probeNow()
+    if (projectStore.isRunning(p.id)) {
+      message.success(`「${p.name}」已重启`)
+    } else {
+      message.warning(`「${p.name}」已启动，但状态未就绪，请查看日志`)
+    }
+    return true
+  })
+  if (err) message.error(`「${p.name}」重启异常：${err}`)
+}
+
 // ===== 删除 =====
 
 async function handleDelete(p: Project) {
@@ -334,6 +405,7 @@ async function stopAll() {
         :group-hue="hueOf(p.scan_root)"
         @start="handleStart(p)"
         @stop="handleStop(p)"
+        @restart="handleRestart(p)"
         @build="handleBuild(p)"
         @log="handleLog(p)"
         @edit="openEdit(p)"
