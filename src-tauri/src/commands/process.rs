@@ -17,6 +17,7 @@ use std::time::Duration;
 use sqlx::Row;
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use tauri::{AppHandle, Manager, Runtime};
+use tracing::warn;
 
 use crate::db;
 use crate::error::{AppError, AppResult};
@@ -32,6 +33,11 @@ use crate::state::AppState;
 
 /// 后台 wait 任务轮询 try_wait 的间隔（ms）。
 const WAIT_CLEANUP_INTERVAL_MS: u64 = 500;
+
+/// stop_project 在 taskkill 后轮询确认进程/端口释放的间隔（ms）。
+const STOP_RELEASE_INTERVAL_MS: u64 = 300;
+/// stop_project 轮询确认的最大次数（≈ 3s 上限）。超时即放行，仅 warn。
+const STOP_RELEASE_MAX_ATTEMPTS: usize = 10;
 
 /// 启动项目。
 ///
@@ -119,16 +125,20 @@ pub async fn start_project<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResult<
 /// 3. expected_ports 端口发现 → 用占用者 pid（兜底：probe 尚未运行的间隙）
 /// 三者皆无 → `NotRunning`。
 ///
-/// 杀树后：registry 有该项目则移除（drop child，因无 kill_on_drop，安全无副作用），
+/// 杀树后：best-effort 轮询确认进程已死 + expected_ports 已释放（规避 taskkill 返回后
+/// 端口/socket 释放滞后导致的重启竞态，最多等 ~3s，超时仅 warn 不报错），
+/// 然后移除 registry（drop child，因无 kill_on_drop，安全无副作用），
 /// 并更新 DB last_stop_time + 清空 last_pid。
 #[tauri::command]
 pub async fn stop_project<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResult<()> {
     let state = app.state::<AppState>();
     let pool = db::pool(&app)?;
 
-    // 取 pid：registry 优先（本会话进程）
-    let pid: u32 = if let Some(snap) = state.registry().snapshot(id) {
-        snap.pid
+    // 取 pid：registry 优先（本会话进程）；同时取出 expected_ports 供后续释放确认
+    // （load_expected_ports 宽容：DB 失败按空 vec，不影响停止）
+    let (pid, ports): (u32, Vec<String>) = if let Some(snap) = state.registry().snapshot(id) {
+        // 本会话进程：expected_ports 仍需从 DB 读（registry 不存）
+        (snap.pid, load_expected_ports(&pool, id).await)
     } else {
         // DB last_pid（重开接管 / probe 发现写入的外部进程）
         let last_pid: Option<i64> = sqlx::query_scalar(
@@ -139,25 +149,16 @@ pub async fn stop_project<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResult<(
         .await?
         .flatten();
         if let Some(p) = last_pid {
-            p as u32
+            (p as u32, load_expected_ports(&pool, id).await)
         } else {
             // 端口发现兜底：查 expected_ports 的占用者（覆盖 probe 尚未运行的间隙）
-            let ports_json: Option<String> = sqlx::query_scalar(
-                "SELECT expected_ports FROM project WHERE id = ?",
-            )
-            .bind(id)
-            .fetch_optional(&pool)
-            .await?;
-            let ports: Vec<String> = ports_json
-                .as_deref()
-                .and_then(|j| serde_json::from_str(j).ok())
-                .unwrap_or_default();
+            let ports = load_expected_ports(&pool, id).await;
             if ports.is_empty() {
                 return Err(AppError::NotRunning(id));
             }
             let sockets = collect_tcp_sockets();
             match ports.iter().find_map(|p| find_port_owner(p, &sockets)) {
-                Some(p) => p,
+                Some(p) => (p, ports),
                 None => return Err(AppError::NotRunning(id)),
             }
         }
@@ -165,6 +166,9 @@ pub async fn stop_project<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResult<(
 
     // taskkill /F /T 杀整树
     kill_process_tree(pid).await?;
+
+    // best-effort 确认进程已死 + 端口已释放（规避重启时 build/start 与旧进程竞态）
+    wait_process_released(&app, pid, &ports).await;
 
     // registry 有该项目则移除（drop child，无 kill_on_drop 不影响子进程）
     state.registry().remove(id);
@@ -549,4 +553,82 @@ async fn fetch_runtime_info(
 /// 用 sysinfo 判断 PID 是否存活。
 fn pid_alive(pid: u32, system: &System) -> bool {
     system.process(Pid::from_u32(pid)).is_some()
+}
+
+/// 从 DB 读取某项目的 expected_ports（JSON TEXT → `Vec<String>`）。
+///
+/// stop_project 三级回退均用本函数补读，供 `wait_process_released` 确认端口释放。
+/// 读取失败按空 vec 处理（仅放弃端口确认，不影响停止——DB 错误不得中止 kill）。
+async fn load_expected_ports(pool: &sqlx::Pool<sqlx::Sqlite>, id: i64) -> Vec<String> {
+    let ports_json: Option<String> = sqlx::query_scalar(
+        "SELECT expected_ports FROM project WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+    ports_json
+        .as_deref()
+        .and_then(|j| serde_json::from_str(j).ok())
+        .unwrap_or_default()
+}
+
+/// taskkill 后 best-effort 轮询确认进程已退出 + expected_ports 已释放。
+///
+/// 解决重启竞态：`taskkill /F /T` 返回时进程对象/端口句柄可能尚未被 OS 回收，
+/// 紧接的 build/start 会因端口被占而失败。本函数在 stop 返回前阻塞等待进程消失 +
+/// expected_ports 不再被监听，使调用方可安全继续。
+/// （产物文件锁随进程退出一并释放，这里只负责等进程与端口。）
+///
+/// - 进程存活判定：`pid_alive`（sysinfo，定向刷新单 pid，避免全表枚举）
+/// - 端口释放判定：`find_port_owner`（netstat2 LISTEN，any-listener——不校验监听者
+///   是否是被杀的进程；若端口被无关进程占用，本函数至多等到超时后 warn 放行）
+/// - 两阶段：先等 PID 死（每轮定向刷新）；死后进入端口扫描阶段，不再刷新 sysinfo
+/// - netstat 失败返回空表且不可区分：按"未确认释放"继续等待（宁可多等，不提前放行）
+/// - 间隔 `STOP_RELEASE_INTERVAL_MS`，最多 `STOP_RELEASE_MAX_ATTEMPTS` 次（≈3s）
+/// - 超时不报错（best-effort），仅 warn；无 expected_ports 时只确认 PID
+async fn wait_process_released<R: Runtime>(
+    app: &AppHandle<R>,
+    pid: u32,
+    ports: &[String],
+) {
+    let mut pid_dead = false;
+    for _ in 0..STOP_RELEASE_MAX_ATTEMPTS {
+        let mut released = false;
+        if !pid_dead {
+            let dead_now = {
+                let system = app.state::<AppState>();
+                let mut system = system.system().lock().expect("sysinfo mutex poisoned");
+                // 定向刷新单 pid（进程死后即从列表移除），避免每次全表枚举
+                system.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
+                !pid_alive(pid, &system)
+            };
+            if dead_now {
+                pid_dead = true;
+                if ports.is_empty() {
+                    return;
+                }
+            }
+        }
+        if pid_dead && !ports.is_empty() {
+            // 进程已死：同轮检查端口（首次死亡时立即检查，避免额外等待一个间隔）
+            let sockets = collect_tcp_sockets();
+            if !sockets.is_empty() {
+                // netstat 成功才下结论：空表视为失败（不可区分），继续等待
+                released = !ports
+                    .iter()
+                    .any(|p| find_port_owner(p, &sockets).is_some());
+            }
+        }
+        if released {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(STOP_RELEASE_INTERVAL_MS)).await;
+    }
+    warn!(
+        "stop_project: 等待 pid={} / ports={:?} 释放超时（{}ms），继续放行",
+        pid,
+        ports,
+        STOP_RELEASE_INTERVAL_MS * STOP_RELEASE_MAX_ATTEMPTS as u64
+    );
 }

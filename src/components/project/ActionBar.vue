@@ -2,7 +2,8 @@
 // 项目卡片底部的操作条。
 // 按钮：启动/停止 | 重启 | 构建(+状态图标) | 日志 | 编辑 | 删除
 //
-// 「重启」= 构建 → 停止 → 启动 三步串行（见 ProjectList.handleRestart）。
+// 「重启」= 停止 → 构建（可选）→ 启动 三步串行（见 ProjectList.handleRestart）。
+// 有 build_cmd 走完整三步；无 build_cmd（纯 dev 模式）走停止 → 启动。
 //
 // 构建状态图标（由父组件用 buildState prop 传入）：
 //   running → 旋转图标；失败(exit_code!=0 且非 running) → 红色 X；否则无图标。
@@ -66,8 +67,8 @@ const buildFailed = computed(
     <NButton
       size="tiny"
       tertiary
-      :disabled="busy || !canBuild || buildRunning"
-      :title="canBuild ? '重新构建并启动（构建 → 停止 → 启动）' : '未配置构建命令'"
+      :disabled="busy || buildRunning"
+      :title="canBuild ? '停止 → 构建 → 启动' : '停止 → 启动'"
       @click="emit('restart')"
     >
       <template #icon>
