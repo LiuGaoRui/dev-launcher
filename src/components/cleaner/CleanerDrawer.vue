@@ -231,6 +231,27 @@ async function handleKillRecommended() {
   }
   await handleKillSelected()
 }
+
+/** 统一解锁：解除所有锁定进程（带二次确认） */
+async function handleUnlockAll() {
+  const n = cleanerStore.lockedCount
+  if (n === 0) return
+  dialog.info({
+    title: '解锁全部',
+    content: `将解除全部 ${n} 个进程的锁定状态，解锁后可被选中、清理和回收内存。`,
+    positiveText: '解锁',
+    negativeText: '取消',
+    onPositiveClick: () => {
+      cleanerStore.unlockAll()
+      message.success(`已解锁 ${n} 个进程`)
+    },
+  })
+}
+
+/** 切换 IDE 保护（无二次确认，底部按钮直接切换） */
+function handleToggleIdeProtection() {
+  cleanerStore.toggleAllowKillIde()
+}
 </script>
 
 <template>
@@ -309,6 +330,16 @@ async function handleKillRecommended() {
           >
             {{ cleanerStore.recommendedPids.length > 0 && cleanerStore.recommendedPids.every((pid: number) => cleanerStore.selectedPids.has(pid)) ? '取消推荐' : '全选推荐' }}
           </NButton>
+          <NButton
+            v-if="cleanerStore.lockedCount > 0"
+            size="small"
+            quaternary
+            :title="`当前有 ${cleanerStore.lockedCount} 个锁定进程`"
+            @click="handleUnlockAll"
+          >
+            <template #icon><NIcon><LockOpenOutline /></NIcon></template>
+            解锁全部({{ cleanerStore.lockedCount }})
+          </NButton>
           <NButton size="small" quaternary :loading="cleanerStore.scanning" @click="cleanerStore.scan()">
             <template #icon><NIcon><RefreshOutline /></NIcon></template>
           </NButton>
@@ -344,7 +375,9 @@ async function handleKillRecommended() {
               'proc-row--protected': cleanerStore.isProtected(p),
               'proc-row--locked': cleanerStore.isLocked(p),
               'proc-row--selected': cleanerStore.selectedPids.has(p.pid),
+              'proc-row--clickable': cleanerStore.isActionable(p),
             }"
+            @click="cleanerStore.toggleSelect(p.pid)"
           >
             <!-- 复选框（锁定/保护 时禁用） -->
             <label class="proc-check" :class="{ 'proc-check--disabled': !cleanerStore.isActionable(p) }">
@@ -442,6 +475,20 @@ async function handleKillRecommended() {
             <span class="footer-mem">{{ formatBytes(cleanerStore.selectedMemory) }}</span>
           </div>
           <div class="footer-actions">
+            <NButton
+              size="small"
+              quaternary
+              :class="{ 'ide-toggle-btn--unlocked': cleanerStore.allowKillIde }"
+              @click="handleToggleIdeProtection"
+            >
+              <template #icon>
+                <NIcon>
+                  <LockOpenOutline v-if="cleanerStore.allowKillIde" />
+                  <LockClosedOutline v-else />
+                </NIcon>
+              </template>
+              {{ cleanerStore.allowKillIde ? '锁定IDE' : '解锁IDE' }}
+            </NButton>
             <NButton size="small" quaternary :disabled="cleanerStore.selectedPidTrees.length === 0" @click="cleanerStore.clearSelection()">
               清空选择
             </NButton>
@@ -548,6 +595,11 @@ async function handleKillRecommended() {
   margin-right: 4px;
 }
 
+/* 底部 IDE 保护切换：解锁态红色高亮提醒 */
+.ide-toggle-btn--unlocked {
+  color: #f5222d !important;
+}
+
 /* 工具栏 */
 .toolbar {
   display: flex;
@@ -601,6 +653,10 @@ async function handleKillRecommended() {
 }
 .proc-row--protected {
   opacity: 0.6;
+}
+/* 可操作行：点击即切换选中 */
+.proc-row--clickable {
+  cursor: pointer;
 }
 
 /* 复选框 */

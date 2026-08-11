@@ -55,6 +55,8 @@ export const useCleanerStore = defineStore('cleaner', () => {
   const killing = ref(false)
   /** 是否正在执行内存回收（修剪工作集） */
   const trimming = ref(false)
+  /** 是否允许清理 IDE 进程（危险模式，关闭 IDE 保护）。默认关闭，不持久化。 */
+  const allowKillIde = ref(false)
   /** 已选中的进程 PID 集合（用于批量清理）。reactive 原生代理 Set，无需重新赋值触发响应。 */
   const selectedPids = reactive(new Set<number>())
   /** 锁定的进程 PID 集合（不可选中、不可清理、不可回收）。持久化到 localStorage。 */
@@ -78,6 +80,15 @@ export const useCleanerStore = defineStore('cleaner', () => {
       for (const pid of [...selectedPids]) {
         if (!currentPids.has(pid)) selectedPids.delete(pid)
       }
+      // 同步清理锁定集中已不存在的 PID（进程已退出但 localStorage 残留旧 PID）
+      let lockedChanged = false
+      for (const pid of [...lockedPids]) {
+        if (!currentPids.has(pid)) {
+          lockedPids.delete(pid)
+          lockedChanged = true
+        }
+      }
+      if (lockedChanged) saveLockedPids(lockedPids)
     } catch (e) {
       // 扫描失败不打断 UI；下次轮询重试
       console.warn('scan_dev_processes 失败:', e)
@@ -90,8 +101,9 @@ export const useCleanerStore = defineStore('cleaner', () => {
 
   // ===== 选择 =====
 
-  /** 某进程是否受保护（不可选中） */
+  /** 某进程是否受保护（不可选中）。开启 allowKillIde 后 IDE 保护失效。 */
   function isProtected(p: DevProcInfo): boolean {
+    if (allowKillIde.value) return false
     return CATEGORY_META[p.category]?.protected === true
   }
 
@@ -110,6 +122,32 @@ export const useCleanerStore = defineStore('cleaner', () => {
       selectedPids.delete(pid)
     }
     saveLockedPids(lockedPids)
+  }
+
+  /** 解除全部锁定（一键统一解锁） */
+  function unlockAll() {
+    if (lockedPids.size === 0) return
+    lockedPids.clear()
+    saveLockedPids(lockedPids)
+  }
+
+  /**
+   * 切换「允许清理 IDE 进程」模式（危险模式）。
+   * 重新开启 IDE 保护时，把已选中的 IDE PID 从选中集移除，避免状态不一致。
+   */
+  function toggleAllowKillIde() {
+    allowKillIde.value = !allowKillIde.value
+    if (!allowKillIde.value) {
+      // 恢复保护：移除已选中 / 已锁定的 IDE 进程
+      let lockedChanged = false
+      for (const p of processes.value) {
+        if (CATEGORY_META[p.category]?.protected === true) {
+          selectedPids.delete(p.pid)
+          if (lockedPids.delete(p.pid)) lockedChanged = true
+        }
+      }
+      if (lockedChanged) saveLockedPids(lockedPids)
+    }
   }
 
   /** 某进程是否可操作（非保护且非锁定）——选中、清理、回收的前置条件 */
@@ -149,6 +187,11 @@ export const useCleanerStore = defineStore('cleaner', () => {
   /** 推荐清理的进程列表（共享过滤结果，避免重复遍历） */
   const recommendedProcs = computed(() =>
     processes.value.filter((p) => p.recommended && !isProtected(p)),
+  )
+
+  /** 当前锁定的进程数（仅统计当前进程列表中实际存在的） */
+  const lockedCount = computed(() =>
+    processes.value.filter((p) => lockedPids.has(p.pid)).length,
   )
 
   /** 推荐清理的 PID 列表 */
@@ -268,6 +311,7 @@ export const useCleanerStore = defineStore('cleaner', () => {
     scanning,
     killing,
     trimming,
+    allowKillIde,
     selectedPids,
     lockedPids,
     recommendedPids,
@@ -275,6 +319,7 @@ export const useCleanerStore = defineStore('cleaner', () => {
     totalProcessMemory,
     selectedMemory,
     selectedPidTrees,
+    lockedCount,
     scan,
     startPolling,
     stopPolling,
@@ -282,6 +327,8 @@ export const useCleanerStore = defineStore('cleaner', () => {
     isLocked,
     isActionable,
     toggleLock,
+    unlockAll,
+    toggleAllowKillIde,
     toggleSelect,
     selectAllRecommended,
     clearSelection,
