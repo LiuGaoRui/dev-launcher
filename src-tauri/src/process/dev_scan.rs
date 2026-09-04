@@ -86,6 +86,14 @@ pub struct DevProcInfo {
     pub tree_pid_list: Vec<u32>,
     /// 是否推荐清理（综合分类 + 内存阈值判定）
     pub recommended: bool,
+    /// 规范化进程指纹（锁定匹配键，基于**未截断**完整命令行计算）。
+    /// 前端锁定时原样回传（CleanerLockInput.fingerprint），后端直接存储。
+    pub fingerprint: String,
+    /// 是否被用户手动锁定（按进程指纹匹配 cleaner_lock 表，与 PID 无关）。
+    /// 由命令层在扫描后填充，扫描本身恒为 false。
+    pub locked: bool,
+    /// 匹配到的锁定条目 id（未锁定为 None；解锁时回传给后端）
+    pub lock_id: Option<i64>,
 }
 
 // ===== 阈值常量（内存，字节） =====
@@ -194,6 +202,9 @@ pub fn scan_dev_processes(system: &System, self_pid: Option<Pid>) -> Vec<DevProc
 
         let recommended = is_recommended(category, tree_mem, pid_u32, self_pid);
 
+        // 指纹必须用截断前的完整命令行计算（见 fingerprint 的文档）
+        let fp = fingerprint(&name, &cmdline_full, cwd.as_deref());
+
         results.push(DevProcInfo {
             pid: pid_u32,
             ppid,
@@ -214,6 +225,9 @@ pub fn scan_dev_processes(system: &System, self_pid: Option<Pid>) -> Vec<DevProc
             category,
             tree_pid_list: tree_pids,
             recommended,
+            fingerprint: fp,
+            locked: false,
+            lock_id: None,
         });
     }
 
@@ -225,7 +239,7 @@ pub fn scan_dev_processes(system: &System, self_pid: Option<Pid>) -> Vec<DevProc
 // ===== 进程识别 =====
 
 /// 判断是否为开发相关进程（java/javaw/node/npm/yarn/pnpm 等）。
-fn is_dev_process(name_lower: &str, exe_lower: &str) -> bool {
+pub(crate) fn is_dev_process(name_lower: &str, exe_lower: &str) -> bool {
     is_java_process(name_lower) || is_node_process(name_lower, exe_lower)
 }
 
@@ -247,7 +261,7 @@ fn is_node_process(name_lower: &str, exe_lower: &str) -> bool {
 /// 判断是否为 IDE 自身进程（IDEA / VSCode / WebStorm 等的主进程）。
 ///
 /// 这些进程的父祖链根，**不应**被清理。判定依据：进程名或 exe 路径特征。
-fn is_ide_process(name_lower: &str, exe_lower: &str, proc: &sysinfo::Process) -> bool {
+pub(crate) fn is_ide_process(name_lower: &str, exe_lower: &str, proc: &sysinfo::Process) -> bool {
     // VSCode 主进程：Code.exe 且 exe 路径含 Microsoft VS Code
     if name_lower == "code.exe" || name_lower == "code" {
         return exe_lower.contains("vscode") || exe_lower.contains("code");
@@ -287,7 +301,7 @@ fn is_ide_process(name_lower: &str, exe_lower: &str, proc: &sysinfo::Process) ->
 
 /// 对单个候选进程执行分类判定。
 #[allow(clippy::too_many_arguments)]
-fn classify(
+pub(crate) fn classify(
     pid: u32,
     name: &str,
     exe: &str,
@@ -415,7 +429,7 @@ fn is_watcher(cmdline_lower: &str) -> bool {
 ///
 /// 孤立进程的典型场景：用户在 IDE 里启动了 dev server / 构建进程，
 /// 关闭项目后这些子进程未随 IDE 退出而退出（无 kill_on_drop），残留在内存中。
-fn is_orphan(
+pub(crate) fn is_orphan(
     _pid: u32,
     ppid: Option<u32>,
     ide_pids: &HashSet<u32>,
@@ -473,8 +487,40 @@ fn is_recommended(category: DevProcCategory, tree_mem: u64, pid: u32, self_pid: 
 
 // ===== 辅助 =====
 
+/// 计算进程指纹（规范化匹配键，Windows 路径大小写不敏感故统一小写）。
+///
+/// 优先级：完整命令行 > 启动目录+进程名 > 进程名。
+/// **必须传入未截断的完整命令行**——若用截断后的展示 cmdline
+/// （`CMDLINE_DISPLAY_MAX`），前缀相同的长命令行（如 Gradle daemon）
+/// 会发生指纹碰撞，锁定粒度失真。锁定写入（`CleanerLockInput.fingerprint`
+/// 由扫描结果原样回传）与扫描匹配共用本函数，同一进程无论以何种
+/// PID 重启，指纹恒定。
+pub(crate) fn fingerprint(name: &str, cmdline: &str, cwd: Option<&str>) -> String {
+    let cmd = cmdline.trim();
+    if !cmd.is_empty() {
+        return format!("cmd:{}", cmd.to_lowercase());
+    }
+    let cwd = cwd.map(str::trim).filter(|c| !c.is_empty());
+    match cwd {
+        Some(cwd) => format!("cwd:{}|{}", cwd.to_lowercase(), name.trim().to_lowercase()),
+        None => format!("name:{}", name.trim().to_lowercase()),
+    }
+}
+
+/// 从 sysinfo 进程表提取指定 PID 的指纹（kill/trim 后端校验锁定用）。
+///
+/// 直接读缓存不刷新（调用方负责先 refresh）。进程不在缓存中（已退出
+/// 或从未扫描过）时返回 None，调用方按未锁定处理。
+pub(crate) fn fingerprint_of_process(system: &System, pid: u32) -> Option<String> {
+    let proc = system.process(Pid::from_u32(pid))?;
+    let name = proc.name().to_string_lossy();
+    let cmdline = join_cmdline(proc.cmd());
+    let cwd = proc.cwd().map(|p| p.to_string_lossy());
+    Some(fingerprint(&name, &cmdline, cwd.as_deref()))
+}
+
 /// 把命令行参数向量连接为单字符串（用于分类匹配与展示）。
-fn join_cmdline(cmd: &[std::ffi::OsString]) -> String {
+pub(crate) fn join_cmdline(cmd: &[std::ffi::OsString]) -> String {
     let parts: Vec<String> = cmd
         .iter()
         .map(|s| s.to_string_lossy().into_owned())
@@ -525,7 +571,7 @@ const JB_PRODUCTS: &[(&str, &str)] = &[
 /// - dev server：识别框架（vite / webpack-dev-server / SpringBoot）
 /// - 构建 daemon：识别构建工具（Gradle Daemon / Maven）
 /// - 其他：退化到 cmdline_hint 或进程名
-fn extract_display_title(
+pub(crate) fn extract_display_title(
     name: &str,
     exe: &str,
     cmd: &[std::ffi::OsString],
@@ -678,7 +724,7 @@ fn identify_dev_server_name(cmdline_lower: &str) -> String {
 /// - Java：main class 简名（最后一个含包名的 class 取简名，如 `Application`），
 ///   或 `-jar xxx.jar` 的 jar 文件名（如 `demo.jar`）
 /// - 其他：退化到进程名
-fn extract_main_script(cmd: &[std::ffi::OsString], kind: &str, name: &str) -> String {
+pub(crate) fn extract_main_script(cmd: &[std::ffi::OsString], kind: &str, name: &str) -> String {
     // 跳过 exe 本身，从第二个参数开始
     if cmd.len() < 2 {
         return String::new();
@@ -784,7 +830,7 @@ fn extract_node_main_script(args: &[&std::ffi::OsString], name: &str) -> String 
 ///
 /// 与 main_script（纯程序名）的区别：cmdline_summary 包含关键参数，
 /// 让用户看到「进程在怎么跑」。如 `vite.js --port 5173`、`-jar demo.jar --server.port=8080`。
-fn extract_cmdline_summary(cmd: &[std::ffi::OsString], kind: &str) -> String {
+pub(crate) fn extract_cmdline_summary(cmd: &[std::ffi::OsString], kind: &str) -> String {
     if cmd.len() < 2 {
         return String::new();
     }
@@ -887,7 +933,7 @@ fn is_meaningful_arg(arg: &str, kind: &str) -> bool {
 /// - Java 服务：从 `-jar` 路径提取所在目录
 /// - Node dev server：从 node_modules 路径提取项目根目录
 /// - Gradle/Maven：从命令行参数提取项目路径
-fn extract_project_path(
+pub(crate) fn extract_project_path(
     cmd: &[std::ffi::OsString],
     exe: &str,
     category: DevProcCategory,
@@ -1123,7 +1169,7 @@ fn extract_hint(cmd: &[std::ffi::OsString], exe: &str, name: &str) -> String {
 }
 
 /// Unix 时间戳（秒）转 ISO 字符串（本地时区）。
-fn unix_to_iso_string(secs: u64) -> Option<String> {
+pub(crate) fn unix_to_iso_string(secs: u64) -> Option<String> {
     use chrono::{Local, TimeZone};
     let dt = Local.timestamp_opt(secs as i64, 0).single()?;
     Some(dt.format("%Y-%m-%d %H:%M:%S").to_string())
@@ -1175,6 +1221,43 @@ mod tests {
         let t = truncate_cmdline(&long);
         assert!(t.ends_with('…'));
         assert!(t.chars().count() == CMDLINE_DISPLAY_MAX + 1); // +1 for ellipsis
+    }
+
+    // ===== fingerprint 测试 =====
+
+    #[test]
+    fn fingerprint_prefers_cmdline() {
+        let fp = fingerprint("java.exe", "java -jar App.jar", Some("D:\\work"));
+        assert_eq!(fp, "cmd:java -jar app.jar");
+    }
+
+    #[test]
+    fn fingerprint_ignores_cmdline_case_and_padding() {
+        let a = fingerprint("java.exe", "  Java -Jar APP.JAR ", None);
+        let b = fingerprint("java.exe", "java -jar app.jar", None);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn fingerprint_falls_back_to_cwd_and_name_when_cmdline_empty() {
+        let fp = fingerprint("Java.exe", "", Some("D:\\Work\\Demo"));
+        assert_eq!(fp, "cwd:d:\\work\\demo|java.exe");
+    }
+
+    #[test]
+    fn fingerprint_falls_back_to_name_only() {
+        let fp = fingerprint("Node.exe", "   ", None);
+        assert_eq!(fp, "name:node.exe");
+    }
+
+    /// 指纹基于完整命令行：前 400 字符相同、尾部不同的超长命令行
+    /// （如不同项目的 Gradle daemon）不得碰撞——展示截断不能参与匹配。
+    #[test]
+    fn fingerprint_uses_full_cmdline_beyond_display_truncation() {
+        let prefix = "x".repeat(CMDLINE_DISPLAY_MAX + 100);
+        let a = fingerprint("java.exe", &format!("{prefix} --server.port=8080"), None);
+        let b = fingerprint("java.exe", &format!("{prefix} --server.port=8081"), None);
+        assert_ne!(a, b);
     }
 
     #[test]

@@ -60,6 +60,11 @@ pub fn run() {
             // system
             commands::system::open_url,
             commands::system::get_app_memory,
+            // port（端口监控器）
+            commands::port::list_listening_ports,
+            // port（端口忽略名单）
+            commands::port::add_port_ignore,
+            commands::port::remove_port_ignore,
             // log
             commands::log::subscribe_log,
             commands::log::clear_log,
@@ -68,6 +73,11 @@ pub fn run() {
             commands::cleaner::kill_dev_processes,
             commands::cleaner::trim_dev_processes,
             commands::cleaner::get_system_memory,
+            // cleaner（进程锁定）
+            commands::cleaner::list_cleaner_locks,
+            commands::cleaner::add_cleaner_lock,
+            commands::cleaner::remove_cleaner_lock,
+            commands::cleaner::clear_cleaner_locks,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

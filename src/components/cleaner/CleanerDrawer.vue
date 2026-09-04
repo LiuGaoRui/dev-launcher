@@ -128,8 +128,13 @@ async function handleTrimAll() {
       }
       if (result) {
         const freed = formatBytes(result.freed_bytes)
+        const skipped = skippedSuffix(result.skipped_locked)
         if (result.failed > 0) {
-          message.warning(`已回收 ${result.trimmed} 项（释放 ${freed}），${result.failed} 项失败`)
+          message.warning(
+            `已回收 ${result.trimmed} 项（释放 ${freed}）${skipped}，${result.failed} 项失败`,
+          )
+        } else if (skipped) {
+          message.warning(`已回收 ${result.trimmed} 项，释放 ${freed} 内存${skipped}`)
         } else {
           message.success(`已回收 ${result.trimmed} 项，释放 ${freed} 内存`)
         }
@@ -152,7 +157,12 @@ async function handleTrimSelected() {
   }
   if (result) {
     const freed = formatBytes(result.freed_bytes)
-    message.success(`已回收 ${result.trimmed} 项，释放 ${freed} 内存`)
+    const skipped = skippedSuffix(result.skipped_locked)
+    if (skipped) {
+      message.warning(`已回收 ${result.trimmed} 项，释放 ${freed} 内存${skipped}`)
+    } else {
+      message.success(`已回收 ${result.trimmed} 项，释放 ${freed} 内存`)
+    }
   }
 }
 
@@ -167,6 +177,11 @@ async function handleTrimOne(p: DevProcInfo) {
     const freed = formatBytes(result.freed_bytes)
     message.success(`已回收，释放 ${freed} 内存`)
   }
+}
+
+/** 结果消息中「跳过锁定」后缀（后端纵深防御拦截到锁定进程时 > 0） */
+function skippedSuffix(n: number): string {
+  return n > 0 ? `，已跳过 ${n} 个锁定进程` : ''
 }
 
 async function handleKillSelected() {
@@ -189,10 +204,13 @@ async function handleKillSelected() {
       }
       if (result) {
         const freed = formatBytes(result.freed_bytes)
+        const skipped = skippedSuffix(result.skipped_locked)
         if (result.failed > 0) {
           message.warning(
-            `已清理 ${result.killed} 项（释放 ${freed}），${result.failed} 项失败（可能权限不足）`,
+            `已清理 ${result.killed} 项（释放 ${freed}）${skipped}，${result.failed} 项失败（可能权限不足）`,
           )
+        } else if (skipped) {
+          message.warning(`已清理 ${result.killed} 项，释放 ${freed} 内存${skipped}`)
         } else {
           message.success(`已清理 ${result.killed} 项，释放 ${freed} 内存`)
         }
@@ -224,26 +242,29 @@ async function handleKillOne(p: DevProcInfo) {
 /** 一键清理推荐项：全选推荐后触发清理 */
 async function handleKillRecommended() {
   cleanerStore.selectAllRecommended()
-  // 若推荐项已全部选中（再次点击 = 取消），不执行清理
+  // 若推荐项已全部选中（再次点击 = 取消），静默不执行清理
   if (cleanerStore.selectedPidTrees.length === 0) {
-    message.info('已取消选中推荐项')
     return
   }
   await handleKillSelected()
 }
 
-/** 统一解锁：解除所有锁定进程（带二次确认） */
+/** 统一解锁：清空全部锁定条目（含未运行进程的指纹条目，带二次确认） */
 async function handleUnlockAll() {
   const n = cleanerStore.lockedCount
   if (n === 0) return
   dialog.info({
     title: '解锁全部',
-    content: `将解除全部 ${n} 个进程的锁定状态，解锁后可被选中、清理和回收内存。`,
+    content: `将清空全部 ${n} 条进程锁定（按指纹持久化，含当前未运行的进程），解锁后可被选中、清理和回收内存。`,
     positiveText: '解锁',
     negativeText: '取消',
-    onPositiveClick: () => {
-      cleanerStore.unlockAll()
-      message.success(`已解锁 ${n} 个进程`)
+    onPositiveClick: async () => {
+      const ok = await cleanerStore.unlockAll()
+      if (ok) {
+        message.success(`已清空 ${n} 条锁定`)
+      } else {
+        message.error('清空锁定失败，请稍后重试')
+      }
     },
   })
 }
@@ -334,7 +355,7 @@ function handleToggleIdeProtection() {
             v-if="cleanerStore.lockedCount > 0"
             size="small"
             quaternary
-            :title="`当前有 ${cleanerStore.lockedCount} 个锁定进程`"
+            :title="`清空全部 ${cleanerStore.lockedCount} 条进程锁定（含未运行的进程）`"
             @click="handleUnlockAll"
           >
             <template #icon><NIcon><LockOpenOutline /></NIcon></template>
@@ -455,7 +476,7 @@ function handleToggleIdeProtection() {
               class="proc-action-btn proc-lock-btn"
               :class="{ 'proc-lock-btn--locked': cleanerStore.isLocked(p) }"
               :title="cleanerStore.isLocked(p) ? '点击解锁' : '锁定（锁定后不可清理和回收）'"
-              @click.stop="cleanerStore.toggleLock(p.pid)"
+              @click.stop="cleanerStore.toggleLock(p)"
             >
               <NIcon size="14">
                 <LockClosedOutline v-if="cleanerStore.isLocked(p)" />

@@ -242,6 +242,7 @@ async function handleRestart(p: Project) {
     }
 
     // 2. 构建（仅当配置了 build_cmd；等待完成，成功才继续）
+    //    无 build_cmd 时静默跳过构建，直接进入启动步骤
     if (p.build_cmd?.trim()) {
       const buildOk = await waitBuildDone(p.id)
       if (!buildOk) {
@@ -249,8 +250,6 @@ async function handleRestart(p: Project) {
         message.error(`「${p.name}」构建失败，项目已停止，请处理后重试`)
         return false
       }
-    } else {
-      message.info(`「${p.name}」未配置构建命令，跳过构建，直接启动`)
     }
 
     // 3. 启动（后端 stop 已确认 PID/端口释放，无需前端重试兜底）
@@ -261,7 +260,6 @@ async function handleRestart(p: Project) {
     }
     // start 返回 Ok 即成功（后端 start_project 已做端口预检 + spawn）；
     // 不再依赖即时 probe 判断"状态未就绪"——受 probing 守卫影响可能读到过期状态，造成误报
-    message.success(`「${p.name}」已重启`)
     return true
   })
   if (err) message.error(`「${p.name}」重启异常：${err}`)

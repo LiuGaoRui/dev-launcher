@@ -144,3 +144,46 @@ pub struct LaunchScheme {
     /// 方案说明（前端 tooltip / 占位提示）
     pub description: String,
 }
+
+// ===== cleaner（内存清理器进程锁定） =====
+
+/// 手动锁定的进程指纹记录（cleaner_lock 表）。
+///
+/// 匹配键是 `fingerprint`（由 `dev_scan::fingerprint` 从完整 cmdline /
+/// cwd / name 规范化生成），与 PID 无关——进程重启后 PID 变化
+/// 不影响锁定。其余字段为锁定时的原始指纹，仅供展示。
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct CleanerLock {
+    pub id: i64,
+    pub fingerprint: String,
+    pub name: String,
+    pub cmdline: String,
+    pub cwd: Option<String>,
+    pub exe: String,
+    pub display_title: String,
+    pub cmdline_summary: String,
+    /// 锁定时的 PID（仅参考展示，不参与匹配）
+    pub locked_pid: i64,
+    pub create_time: String,
+}
+
+/// 锁定一个进程的输入（前端从扫描到的 DevProcInfo 提取指纹字段回传）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct CleanerLockInput {
+    /// 规范化匹配键（DevProcInfo.fingerprint 原样回传，后端不重算）。
+    /// 基于未截断完整命令行计算，保证锁定与扫描匹配同源。
+    pub fingerprint: String,
+    pub name: String,
+    #[serde(default)]
+    pub cmdline: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub exe: String,
+    #[serde(default)]
+    pub display_title: String,
+    #[serde(default)]
+    pub cmdline_summary: String,
+    /// 锁定时的 PID（仅参考）
+    pub pid: u32,
+}

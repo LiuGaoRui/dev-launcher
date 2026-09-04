@@ -1,4 +1,5 @@
-//! cleaner 命令薄层：scan_dev_processes / kill_dev_processes / trim_dev_processes / get_system_memory。
+//! cleaner 命令薄层：scan_dev_processes / kill_dev_processes / trim_dev_processes / get_system_memory
+//! + 进程锁定 CRUD（list_cleaner_locks / add_cleaner_lock / remove_cleaner_lock / clear_cleaner_locks）。
 //!
 //! 内存清理器后端：扫描整机开发进程（java/node），智能分类 + 推荐清理目标，
 //! 批量杀进程树、修剪工作集回收内存、查询系统内存概况。
@@ -14,10 +15,13 @@ use serde::Serialize;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
 use tauri::{AppHandle, Manager, Runtime};
 
+use crate::db;
 use crate::error::AppResult;
+use crate::models::{CleanerLock, CleanerLockInput};
 use crate::process::dev_scan::{self, DevProcInfo};
 use crate::process::kill::kill_process_tree;
 use crate::process::trim::trim_working_set;
+use crate::services::CleanerLockService;
 
 /// 构建开发进程扫描所需的 ProcessRefreshKind。
 ///
@@ -41,6 +45,8 @@ pub struct KillResult {
     pub killed: u32,
     /// 杀失败的进程树数量
     pub failed: u32,
+    /// 因命中锁定表被跳过的进程树数量（后端纵深防御）
+    pub skipped_locked: u32,
     /// 杀死前这些进程树的内存总和（字节，用于展示「已释放」）
     pub freed_bytes: u64,
 }
@@ -52,6 +58,8 @@ pub struct TrimResult {
     pub trimmed: u32,
     /// 修剪失败的进程数量（权限不足或进程已退出）
     pub failed: u32,
+    /// 因命中锁定表被跳过的进程数量（后端纵深防御）
+    pub skipped_locked: u32,
     /// 回收的物理内存总量（字节，回收前后 RSS 差值之和）
     pub freed_bytes: u64,
 }
@@ -81,11 +89,31 @@ pub async fn scan_dev_processes<R: Runtime>(app: AppHandle<R>) -> AppResult<Vec<
     let self_pid = sysinfo::get_current_pid().ok();
 
     // 刷新全系统进程（cpu + 内存 + 命令行 + cwd + exe）后扫描
-    let processes = {
+    let mut processes = {
         let mut system = state.system().lock().expect("sysinfo mutex poisoned");
         system.refresh_processes_specifics(ProcessesToUpdate::All, true, dev_refresh_kind());
         dev_scan::scan_dev_processes(&system, self_pid)
     };
+
+    // 标注锁定态：按进程指纹匹配 cleaner_lock 表（与 PID 无关，进程重启后仍能命中）。
+    // 指纹在扫描时已基于完整命令行算好（DevProcInfo.fingerprint）。
+    // DB 读失败降级为全未锁定（不阻断扫描），下次轮询自动恢复。
+    let pool = db::pool(&app);
+    match pool {
+        Ok(pool) => match CleanerLockService::locked_map(&pool).await {
+            Ok(locked) if !locked.is_empty() => {
+                for p in processes.iter_mut() {
+                    if let Some(&id) = locked.get(&p.fingerprint) {
+                        p.locked = true;
+                        p.lock_id = Some(id);
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("读取进程锁定表失败（本次扫描不标注锁定态）: {e}"),
+        },
+        Err(e) => tracing::warn!("获取数据库连接池失败（本次扫描不标注锁定态）: {e}"),
+    }
 
     Ok(processes)
 }
@@ -95,8 +123,8 @@ pub async fn scan_dev_processes<R: Runtime>(app: AppHandle<R>) -> AppResult<Vec<
 /// `pid_trees` 每个元素是一棵进程树的根 PID（整树由后端 taskkill /T 递归处理，
 /// 故每个元素取首个根 PID 即可，其余 PID 用于统计 freed_bytes）。
 ///
-/// 返回 `KillResult { killed, failed, freed_bytes }`。
-/// 单棵树失败不中断其余，计入 failed。
+/// 安全护栏：拒绝杀本应用自身进程；命中 cleaner_lock 锁定表的树整树跳过
+/// （纵深防御，前端已过滤）。返回 `KillResult`，单棵树失败不中断其余，计入 failed。
 #[tauri::command]
 pub async fn kill_dev_processes<R: Runtime>(
     app: AppHandle<R>,
@@ -106,6 +134,7 @@ pub async fn kill_dev_processes<R: Runtime>(
         return Ok(KillResult {
             killed: 0,
             failed: 0,
+            skipped_locked: 0,
             freed_bytes: 0,
         });
     }
@@ -114,13 +143,36 @@ pub async fn kill_dev_processes<R: Runtime>(
     let self_pid = sysinfo::get_current_pid().ok();
     let self_pid_u32 = self_pid.map(|p| p.as_u32());
 
-    // 先在持锁期间统计待杀进程树的内存（杀之前）
+    // 锁定表（不持 sysinfo 锁做 DB IO）；读失败降级为空集（与扫描降级策略一致）
+    let locked_map = match db::pool(&app) {
+        Ok(pool) => CleanerLockService::locked_map(&pool).await.unwrap_or_else(|e| {
+            tracing::warn!("读取进程锁定表失败（本次不拦截锁定进程）: {e}");
+            std::collections::HashMap::new()
+        }),
+        Err(e) => {
+            tracing::warn!("获取数据库连接池失败（本次不拦截锁定进程）: {e}");
+            std::collections::HashMap::new()
+        }
+    };
+
+    // 持锁刷新 + 统计待杀树内存 + 标记锁定树（杀之前；锁定树不计内存）
     let mut freed_bytes = 0u64;
+    let mut locked_roots: std::collections::HashSet<u32> = std::collections::HashSet::new();
     {
         let state = app.state::<AppState>();
         let mut system = state.system().lock().expect("sysinfo mutex poisoned");
         system.refresh_processes_specifics(ProcessesToUpdate::All, true, dev_refresh_kind());
         for tree in &pid_trees {
+            // 锁定校验：根 PID 指纹命中 → 整树跳过
+            // （进程不在缓存中时按未锁定处理，维持原有行为）
+            if let Some(&root) = tree.first() {
+                if let Some(fp) = dev_scan::fingerprint_of_process(&system, root) {
+                    if locked_map.contains_key(&fp) {
+                        locked_roots.insert(root);
+                        continue;
+                    }
+                }
+            }
             for &pid_u32 in tree {
                 if Some(pid_u32) == self_pid_u32 {
                     // 跳过自身，不计内存
@@ -144,7 +196,7 @@ pub async fn kill_dev_processes<R: Runtime>(
         .iter()
         .filter_map(|tree| {
             let root = tree.first()?;
-            if Some(*root) == self_pid_u32 {
+            if Some(*root) == self_pid_u32 || locked_roots.contains(root) {
                 None
             } else {
                 Some(kill_process_tree(*root))
@@ -158,6 +210,7 @@ pub async fn kill_dev_processes<R: Runtime>(
     Ok(KillResult {
         killed,
         failed,
+        skipped_locked: locked_roots.len() as u32,
         freed_bytes,
     })
 }
@@ -181,6 +234,7 @@ pub async fn trim_dev_processes<R: Runtime>(
         return Ok(TrimResult {
             trimmed: 0,
             failed: 0,
+            skipped_locked: 0,
             freed_bytes: 0,
         });
     }
@@ -188,31 +242,48 @@ pub async fn trim_dev_processes<R: Runtime>(
     // 安全护栏：拒绝回收本应用自身进程（虽无害，但无意义）
     let self_pid_u32 = sysinfo::get_current_pid().ok().map(|p| p.as_u32());
 
+    // 锁定表（不持 sysinfo 锁做 DB IO）；读失败降级为空集（与扫描降级策略一致）
+    let locked_map = match db::pool(&app) {
+        Ok(pool) => CleanerLockService::locked_map(&pool).await.unwrap_or_else(|e| {
+            tracing::warn!("读取进程锁定表失败（本次不拦截锁定进程）: {e}");
+            std::collections::HashMap::new()
+        }),
+        Err(e) => {
+            tracing::warn!("获取数据库连接池失败（本次不拦截锁定进程）: {e}");
+            std::collections::HashMap::new()
+        }
+    };
+
     let state = app.state::<AppState>();
 
-    // 1. 回收前：读取各进程 RSS（持锁）
+    // 1. 回收前：读取各进程 RSS（持锁），命中锁定的 PID 直接跳过
+    let mut skipped_locked = 0u32;
     let before_mem: std::collections::HashMap<u32, u64> = {
         let mut system = state.system().lock().expect("sysinfo mutex poisoned");
         system.refresh_processes_specifics(ProcessesToUpdate::All, true, dev_refresh_kind());
-        pids.iter()
-            .filter_map(|&pid| {
-                if Some(pid) == self_pid_u32 {
-                    return None;
+        let mut mem = std::collections::HashMap::new();
+        for &pid in &pids {
+            if Some(pid) == self_pid_u32 {
+                continue;
+            }
+            // 锁定校验（进程不在缓存中时按未锁定处理，维持原有行为）
+            if let Some(fp) = dev_scan::fingerprint_of_process(&system, pid) {
+                if locked_map.contains_key(&fp) {
+                    skipped_locked += 1;
+                    continue;
                 }
-                system
-                    .process(Pid::from_u32(pid))
-                    .map(|proc| (pid, proc.memory()))
-            })
-            .collect()
+            }
+            if let Some(proc) = system.process(Pid::from_u32(pid)) {
+                mem.insert(pid, proc.memory());
+            }
+        }
+        mem
     };
 
-    // 2. 逐个修剪工作集（OS 调用，不持 sysinfo 锁）
+    // 2. 逐个修剪工作集（OS 调用，不持 sysinfo 锁；锁定/自身 PID 已被排除）
     let mut trimmed = 0u32;
     let mut failed = 0u32;
-    for &pid in &pids {
-        if Some(pid) == self_pid_u32 {
-            continue;
-        }
+    for &pid in before_mem.keys() {
         match trim_working_set(pid) {
             Ok(()) => trimmed += 1,
             Err(_) => failed += 1,
@@ -242,6 +313,7 @@ pub async fn trim_dev_processes<R: Runtime>(
     Ok(TrimResult {
         trimmed,
         failed,
+        skipped_locked,
         freed_bytes,
     })
 }
@@ -272,4 +344,44 @@ pub async fn get_system_memory<R: Runtime>(app: AppHandle<R>) -> AppResult<Syste
         available_bytes: available,
         used_percent,
     })
+}
+
+/// 进程锁定 CRUD（薄层，业务在 CleanerLockService）。
+///
+/// 锁定按进程指纹（cmdline 优先，cwd+name 兜底）持久化到 cleaner_lock 表，
+/// 与 PID 解耦——进程重启后 PID 变化不影响锁定，条目永不自动删除。
+/// 语义：指纹相同的多个进程实例会被一并锁定/解锁（指纹无法区分实例）。
+
+/// 列出全部锁定条目（含未运行的进程，按锁定时间倒序）。
+#[tauri::command]
+pub async fn list_cleaner_locks<R: Runtime>(app: AppHandle<R>) -> AppResult<Vec<CleanerLock>> {
+    let pool = db::pool(&app)?;
+    CleanerLockService::list(&pool).await
+}
+
+/// 锁定一个进程（按指纹去重，重复锁定幂等）。返回该指纹的锁定条目。
+#[tauri::command]
+pub async fn add_cleaner_lock<R: Runtime>(
+    app: AppHandle<R>,
+    input: CleanerLockInput,
+) -> AppResult<CleanerLock> {
+    let pool = db::pool(&app)?;
+    CleanerLockService::add(&pool, input).await
+}
+
+/// 解除单条进程锁定（lock_id 来自扫描结果 DevProcInfo.lock_id）。
+#[tauri::command]
+pub async fn remove_cleaner_lock<R: Runtime>(
+    app: AppHandle<R>,
+    lock_id: i64,
+) -> AppResult<()> {
+    let pool = db::pool(&app)?;
+    CleanerLockService::remove(&pool, lock_id).await
+}
+
+/// 清空全部进程锁定条目（「解锁全部」）。
+#[tauri::command]
+pub async fn clear_cleaner_locks<R: Runtime>(app: AppHandle<R>) -> AppResult<()> {
+    let pool = db::pool(&app)?;
+    CleanerLockService::clear(&pool).await
 }

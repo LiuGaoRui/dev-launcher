@@ -1,8 +1,16 @@
 // cleaner 命令薄包装。
-// 对齐 src-tauri/src/commands/cleaner.rs：scan_dev_processes / kill_dev_processes / get_system_memory。
+// 对齐 src-tauri/src/commands/cleaner.rs：scan_dev_processes / kill_dev_processes /
+// get_system_memory + 进程锁定 CRUD（list/add/remove/clear_cleaner_locks）。
 
 import { invokeCmd } from './invoke'
-import type { DevProcInfo, KillResult, SystemMemory, TrimResult } from '@/types/cleaner'
+import type {
+  CleanerLock,
+  CleanerLockInput,
+  DevProcInfo,
+  KillResult,
+  SystemMemory,
+  TrimResult,
+} from '@/types/cleaner'
 
 /**
  * 扫描全系统开发进程（java/javaw/node 等），返回智能分类后的列表。
@@ -45,4 +53,29 @@ export function trimDevProcesses(pids: number[]): Promise<TrimResult> {
  */
 export function getSystemMemory(): Promise<SystemMemory> {
   return invokeCmd<SystemMemory>('get_system_memory')
+}
+
+// ===== 进程锁定（指纹持久化，与 PID 无关） =====
+
+/** 列出全部锁定条目（含未运行的进程，按锁定时间倒序） */
+export function listCleanerLocks(): Promise<CleanerLock[]> {
+  return invokeCmd<CleanerLock[]>('list_cleaner_locks')
+}
+
+/**
+ * 锁定一个进程（按指纹去重，重复锁定幂等）。
+ * input 字段取自扫描结果 DevProcInfo 的指纹字段，后端规范化为匹配键。
+ */
+export function addCleanerLock(input: CleanerLockInput): Promise<CleanerLock> {
+  return invokeCmd<CleanerLock>('add_cleaner_lock', { input })
+}
+
+/** 解除单条进程锁定（lockId 来自 DevProcInfo.lock_id） */
+export function removeCleanerLock(lockId: number): Promise<void> {
+  return invokeCmd<void>('remove_cleaner_lock', { lockId })
+}
+
+/** 清空全部进程锁定条目（「解锁全部」） */
+export function clearCleanerLocks(): Promise<void> {
+  return invokeCmd<void>('clear_cleaner_locks')
 }

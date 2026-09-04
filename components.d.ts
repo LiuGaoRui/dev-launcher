@@ -12,6 +12,7 @@ declare module 'vue' {
     CleanerDrawer: typeof import('./src/components/cleaner/CleanerDrawer.vue')['default']
     MetricsBar: typeof import('./src/components/project/MetricsBar.vue')['default']
     PlaceholderPage: typeof import('./src/components/PlaceholderPage.vue')['default']
+    PortMonitorModal: typeof import('./src/components/port/PortMonitorModal.vue')['default']
     ProjectCard: typeof import('./src/components/project/ProjectCard.vue')['default']
     ProjectFormDialog: typeof import('./src/components/project/ProjectFormDialog.vue')['default']
     ProjectScanDialog: typeof import('./src/components/project/ProjectScanDialog.vue')['default']

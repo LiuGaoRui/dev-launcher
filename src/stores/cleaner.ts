@@ -7,12 +7,30 @@
 // 杀进程操作不自动执行——所有清理都需用户确认后调用 killSelected()。
 //
 // 锁定机制：用户可锁定某些进程，锁定后该进程不可被选中、不可被清理/回收。
-// 锁定集持久化到 localStorage（跨会话保留），按 PID 索引。
+// 锁定按进程指纹（cmdline 优先，cwd+name 兜底）持久化到后端 cleaner_lock 表，
+// 与 PID 无关——进程重启后 PID 变化不影响锁定，条目永不自动丢失；
+// 进程未运行时条目也保留，仅「解锁全部」可清空。
+// 指纹相同的多个进程实例会被一并锁定/解锁（指纹无法区分实例）。
 
 import { defineStore } from 'pinia'
 import { computed, reactive, ref } from 'vue'
-import { scanDevProcesses, killDevProcesses, trimDevProcesses, getSystemMemory } from '@/api/cleaner'
-import type { DevProcInfo, KillResult, SystemMemory, TrimResult } from '@/types/cleaner'
+import {
+  scanDevProcesses,
+  killDevProcesses,
+  trimDevProcesses,
+  getSystemMemory,
+  listCleanerLocks,
+  addCleanerLock,
+  removeCleanerLock,
+  clearCleanerLocks,
+} from '@/api/cleaner'
+import type {
+  CleanerLockInput,
+  DevProcInfo,
+  KillResult,
+  SystemMemory,
+  TrimResult,
+} from '@/types/cleaner'
 import { CATEGORY_META } from '@/types/cleaner'
 import { safeCall } from '@/api/invoke'
 import { usePolling } from '@/composables/usePolling'
@@ -20,28 +38,12 @@ import { usePolling } from '@/composables/usePolling'
 /** 清理抽屉轮询间隔（ms）：比项目监控稍慢，5s 足够 */
 export const CLEANER_POLL_MS = 5000
 
-/** localStorage 键：锁定的进程 PID 集合（JSON 数组） */
-const LOCKED_PIDS_STORAGE_KEY = 'devlauncher:cleaner:lockedPids'
-
-/** 从 localStorage 加载锁定的 PID 集合 */
-function loadLockedPids(): Set<number> {
-  try {
-    const raw = localStorage.getItem(LOCKED_PIDS_STORAGE_KEY)
-    if (!raw) return new Set()
-    const arr = JSON.parse(raw) as number[]
-    return new Set(arr.filter((n) => typeof n === 'number'))
-  } catch {
-    return new Set()
-  }
-}
-
-/** 持久化锁定的 PID 集合到 localStorage */
-function saveLockedPids(pids: Set<number>) {
-  try {
-    localStorage.setItem(LOCKED_PIDS_STORAGE_KEY, JSON.stringify([...pids]))
-  } catch {
-    // localStorage 不可用时静默降级（仅当前会话有效）
-  }
+// 旧版把锁定 PID 存 localStorage，进程重启后即失效（且被轮询清理逻辑清除），
+// 已被后端指纹锁定取代。残留 key 一次性清除（旧 PID 无法迁移为指纹）。
+try {
+  localStorage.removeItem('devlauncher:cleaner:lockedPids')
+} catch {
+  // localStorage 不可用时忽略
 }
 
 export const useCleanerStore = defineStore('cleaner', () => {
@@ -59,8 +61,18 @@ export const useCleanerStore = defineStore('cleaner', () => {
   const allowKillIde = ref(false)
   /** 已选中的进程 PID 集合（用于批量清理）。reactive 原生代理 Set，无需重新赋值触发响应。 */
   const selectedPids = reactive(new Set<number>())
-  /** 锁定的进程 PID 集合（不可选中、不可清理、不可回收）。持久化到 localStorage。 */
-  const lockedPids = reactive(loadLockedPids())
+  /**
+   * 锁定条目总数（cleaner_lock 表，含未运行进程的条目）。
+   * 「解锁全部」按此计数清空所有条目；单个进程的锁定态看 DevProcInfo.locked。
+   */
+  const lockedCount = ref(0)
+
+  /** 从后端拉取锁定条目总数（store 初始化时加载一次，增删锁定时本地维护） */
+  async function refreshLockCount() {
+    const [locks, err] = await safeCall(() => listCleanerLocks())
+    if (!err && locks) lockedCount.value = locks.length
+  }
+  void refreshLockCount()
 
   // ===== 扫描 =====
 
@@ -75,20 +87,12 @@ export const useCleanerStore = defineStore('cleaner', () => {
       ])
       processes.value = procs
       systemMem.value = mem
-      // 清理已选中但已不存在的 PID（杀掉的进程应从选中集移除）
+      // 清理已选中但已不存在的 PID（杀掉的进程应从选中集移除）。
+      // 注意：不清理锁定——锁定按指纹持久化在库中，进程不在运行也保留。
       const currentPids = new Set(procs.map((p) => p.pid))
       for (const pid of [...selectedPids]) {
         if (!currentPids.has(pid)) selectedPids.delete(pid)
       }
-      // 同步清理锁定集中已不存在的 PID（进程已退出但 localStorage 残留旧 PID）
-      let lockedChanged = false
-      for (const pid of [...lockedPids]) {
-        if (!currentPids.has(pid)) {
-          lockedPids.delete(pid)
-          lockedChanged = true
-        }
-      }
-      if (lockedChanged) saveLockedPids(lockedPids)
     } catch (e) {
       // 扫描失败不打断 UI；下次轮询重试
       console.warn('scan_dev_processes 失败:', e)
@@ -107,46 +111,98 @@ export const useCleanerStore = defineStore('cleaner', () => {
     return CATEGORY_META[p.category]?.protected === true
   }
 
-  /** 某进程是否被用户锁定（不可选中、不可清理、不可回收） */
+  /** 某进程是否被用户锁定（不可选中、不可清理、不可回收）。
+   *  锁定态由后端按指纹匹配后随扫描结果返回（DevProcInfo.locked）。 */
   function isLocked(p: DevProcInfo): boolean {
-    return lockedPids.has(p.pid)
+    return p.locked
   }
 
-  /** 切换某进程的锁定态 */
-  function toggleLock(pid: number) {
-    if (lockedPids.has(pid)) {
-      lockedPids.delete(pid)
-    } else {
-      lockedPids.add(pid)
-      // 锁定时从选中集移除（锁定优先于选中）
-      selectedPids.delete(pid)
+  /** 从 DevProcInfo 提取锁定指纹输入（与后端 CleanerLockInput 对齐，snake_case） */
+  function toLockInput(p: DevProcInfo): CleanerLockInput {
+    return {
+      fingerprint: p.fingerprint,
+      name: p.name,
+      cmdline: p.cmdline,
+      cwd: p.cwd,
+      exe: p.exe,
+      display_title: p.display_title,
+      cmdline_summary: p.cmdline_summary,
+      pid: p.pid,
     }
-    saveLockedPids(lockedPids)
   }
 
-  /** 解除全部锁定（一键统一解锁） */
-  function unlockAll() {
-    if (lockedPids.size === 0) return
-    lockedPids.clear()
-    saveLockedPids(lockedPids)
+  /**
+   * 切换某进程的锁定态：指纹持久化到后端 cleaner_lock 表（与 PID 无关）。
+   * 成功后本地同步列表状态；同指纹的其他实例由下次扫描自动标注。
+   */
+  async function toggleLock(p: DevProcInfo): Promise<void> {
+    if (p.locked) {
+      if (p.lock_id == null) return
+      const lockId = p.lock_id
+      const [, err] = await safeCall(() => removeCleanerLock(lockId))
+      if (err) return
+      for (const q of processes.value) {
+        if (q.lock_id === lockId) {
+          q.locked = false
+          q.lock_id = null
+        }
+      }
+      lockedCount.value = Math.max(0, lockedCount.value - 1)
+    } else {
+      const [lock, err] = await safeCall(() => addCleanerLock(toLockInput(p)))
+      if (err || !lock) return
+      for (const q of processes.value) {
+        if (q.pid === p.pid) {
+          q.locked = true
+          q.lock_id = lock.id
+        }
+      }
+      // 锁定时从选中集移除（锁定优先于选中）
+      selectedPids.delete(p.pid)
+      lockedCount.value += 1
+    }
+  }
+
+  /** 解除全部锁定（清空 cleaner_lock 表所有条目，含未运行进程的）。
+   *  返回是否成功（失败时本地锁定态保持不变，下轮扫描自动对齐）。 */
+  async function unlockAll(): Promise<boolean> {
+    if (lockedCount.value === 0) return true
+    const [, err] = await safeCall(() => clearCleanerLocks())
+    if (err) return false
+    for (const q of processes.value) {
+      q.locked = false
+      q.lock_id = null
+    }
+    lockedCount.value = 0
+    return true
   }
 
   /**
    * 切换「允许清理 IDE 进程」模式（危险模式）。
-   * 重新开启 IDE 保护时，把已选中的 IDE PID 从选中集移除，避免状态不一致。
+   * 重新开启 IDE 保护时，把已选中的 IDE PID 从选中集移除，并解除已锁定
+   * IDE 进程的锁定（指纹条目从库中删除），避免状态不一致。
    */
   function toggleAllowKillIde() {
     allowKillIde.value = !allowKillIde.value
     if (!allowKillIde.value) {
-      // 恢复保护：移除已选中 / 已锁定的 IDE 进程
-      let lockedChanged = false
+      const unlockedIds = new Set<number>()
       for (const p of processes.value) {
-        if (CATEGORY_META[p.category]?.protected === true) {
-          selectedPids.delete(p.pid)
-          if (lockedPids.delete(p.pid)) lockedChanged = true
+        if (CATEGORY_META[p.category]?.protected !== true) continue
+        selectedPids.delete(p.pid)
+        if (p.locked && p.lock_id != null) {
+          unlockedIds.add(p.lock_id)
+          p.locked = false
+          p.lock_id = null
         }
       }
-      if (lockedChanged) saveLockedPids(lockedPids)
+      if (unlockedIds.size > 0) {
+        // 后台批量删除锁定条目；先乐观扣减计数，完成后无论成败统一对账，
+        // 避免个别删除失败导致 lockedCount 与库持久偏离
+        lockedCount.value = Math.max(0, lockedCount.value - unlockedIds.size)
+        void Promise.allSettled([...unlockedIds].map((id) => removeCleanerLock(id))).then(
+          () => refreshLockCount(),
+        )
+      }
     }
   }
 
@@ -187,11 +243,6 @@ export const useCleanerStore = defineStore('cleaner', () => {
   /** 推荐清理的进程列表（共享过滤结果，避免重复遍历） */
   const recommendedProcs = computed(() =>
     processes.value.filter((p) => p.recommended && !isProtected(p)),
-  )
-
-  /** 当前锁定的进程数（仅统计当前进程列表中实际存在的） */
-  const lockedCount = computed(() =>
-    processes.value.filter((p) => lockedPids.has(p.pid)).length,
   )
 
   /** 推荐清理的 PID 列表 */
@@ -313,7 +364,6 @@ export const useCleanerStore = defineStore('cleaner', () => {
     trimming,
     allowKillIde,
     selectedPids,
-    lockedPids,
     recommendedPids,
     totalRecommendedMemory,
     totalProcessMemory,

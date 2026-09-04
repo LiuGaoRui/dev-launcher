@@ -2,11 +2,15 @@
 //!
 //! 纯业务逻辑，不依赖 Tauri，接收 `&Pool<Sqlite>`。便于单测。
 
+pub mod cleaner_lock_service;
 pub mod detect_service;
+pub mod port_ignore_service;
 pub mod project_service;
 pub mod scan_root_service;
 
+pub use cleaner_lock_service::CleanerLockService;
 pub use detect_service::DetectService;
+pub use port_ignore_service::PortIgnoreService;
 pub use project_service::ProjectService;
 pub use scan_root_service::ScanRootService;
 

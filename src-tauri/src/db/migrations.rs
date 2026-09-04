@@ -33,5 +33,17 @@ pub fn migrations() -> Vec<Migration> {
             sql: include_str!("../../migrations/0004_add_sort_order.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 5,
+            description: "add cleaner_lock table",
+            sql: include_str!("../../migrations/0005_add_cleaner_lock.sql"),
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 6,
+            description: "add port_ignore table",
+            sql: include_str!("../../migrations/0006_add_port_ignore.sql"),
+            kind: MigrationKind::Up,
+        },
     ]
 }

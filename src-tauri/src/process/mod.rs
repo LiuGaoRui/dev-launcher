@@ -10,12 +10,14 @@
 //! - `kill`：进程树终止公共封装（taskkill /F /T）
 //! - `trim`：进程内存回收（修剪工作集，不杀进程）
 //! - `dev_scan`：全系统开发进程扫描 + 智能分类（内存清理器用）
+//! - `port_scan`：本机监听端口扫描 + 分类评分（端口监控器用）
 
 pub mod build;
 pub mod dev_scan;
 pub mod job_object;
 pub mod kill;
 pub mod monitor;
+pub mod port_scan;
 pub mod registry;
 pub mod spawn;
 pub mod tree;

@@ -1,5 +1,6 @@
 // 与 src-tauri/src/process/dev_scan.rs 的 DevProcCategory / DevProcInfo 对齐。
 // 与 src-tauri/src/commands/cleaner.rs 的 KillResult / SystemMemory 对齐。
+// 与 src-tauri/src/models.rs 的 CleanerLock / CleanerLockInput 对齐。
 // serde 默认输出 snake_case；DevProcCategory 为 snake_case 枚举字符串。
 
 /**
@@ -72,6 +73,13 @@ export interface DevProcInfo {
   tree_pid_list: number[]
   /** 是否推荐清理 */
   recommended: boolean
+  /** 规范化进程指纹（后端基于未截断完整命令行计算，锁定匹配键）。
+   *  锁定时原样回传后端，前端不解析。 */
+  fingerprint: string
+  /** 是否被用户手动锁定（后端按进程指纹匹配 cleaner_lock 表，与 PID 无关） */
+  locked: boolean
+  /** 匹配到的锁定条目 id（未锁定为 null；解锁时回传后端） */
+  lock_id: number | null
 }
 
 /** 批量杀进程的结果（对齐 Rust `KillResult`） */
@@ -80,6 +88,8 @@ export interface KillResult {
   killed: number
   /** 杀失败的进程树数量 */
   failed: number
+  /** 因命中锁定表被跳过的进程树数量（后端纵深防御） */
+  skipped_locked: number
   /** 杀死前这些进程树的内存总和（字节） */
   freed_bytes: number
 }
@@ -90,6 +100,8 @@ export interface TrimResult {
   trimmed: number
   /** 修剪失败的进程数量（权限不足或进程已退出） */
   failed: number
+  /** 因命中锁定表被跳过的进程数量（后端纵深防御） */
+  skipped_locked: number
   /** 回收的物理内存总量（字节，回收前后 RSS 差值之和） */
   freed_bytes: number
 }
@@ -104,4 +116,46 @@ export interface SystemMemory {
   available_bytes: number
   /** 使用率（0-100） */
   used_percent: number
+}
+
+/**
+ * 手动锁定的进程指纹记录（对齐 Rust `CleanerLock`，cleaner_lock 表）。
+ *
+ * 匹配键是 fingerprint（后端由 cmdline/cwd/name 规范化生成），与 PID 无关——
+ * 进程重启后 PID 变化不影响锁定。其余字段为锁定时的原始指纹，仅供展示。
+ */
+export interface CleanerLock {
+  id: number
+  /** 规范化匹配键 */
+  fingerprint: string
+  /** 进程名（如 java.exe） */
+  name: string
+  /** 完整命令行（锁定时） */
+  cmdline: string
+  /** 启动目录（锁定时），可能为 null */
+  cwd: string | null
+  /** 可执行文件路径 */
+  exe: string
+  /** 展示名（如「vite dev」） */
+  display_title: string
+  /** 命令行摘要 */
+  cmdline_summary: string
+  /** 锁定时的 PID（仅参考，不参与匹配） */
+  locked_pid: number
+  /** 锁定时间 */
+  create_time: string
+}
+
+/** 锁定一个进程的输入（对齐 Rust `CleanerLockInput`，字段取自 DevProcInfo） */
+export interface CleanerLockInput {
+  /** 规范化匹配键（DevProcInfo.fingerprint 原样回传，后端不重算） */
+  fingerprint: string
+  name: string
+  cmdline: string
+  cwd: string | null
+  exe: string
+  display_title: string
+  cmdline_summary: string
+  /** 锁定时的 PID（仅参考） */
+  pid: number
 }

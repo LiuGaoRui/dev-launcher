@@ -10,7 +10,7 @@
 
 import { computed } from 'vue'
 import { NButton, NIcon } from 'naive-ui'
-import { RefreshOutline, ReloadCircleOutline, CloseCircle } from '@vicons/ionicons5'
+import { RefreshOutline, CloseCircle } from '@vicons/ionicons5'
 import type { BuildState } from '@/types/project'
 
 const props = defineProps<{
@@ -71,9 +71,6 @@ const buildFailed = computed(
       :title="canBuild ? '停止 → 构建 → 启动' : '停止 → 启动'"
       @click="emit('restart')"
     >
-      <template #icon>
-        <NIcon><ReloadCircleOutline /></NIcon>
-      </template>
       重启
     </NButton>
     <NButton
