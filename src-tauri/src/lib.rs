@@ -67,6 +67,7 @@ pub fn run() {
             commands::port::remove_port_ignore,
             // log
             commands::log::subscribe_log,
+            commands::log::unsubscribe_log,
             commands::log::clear_log,
             // cleaner（内存清理器）
             commands::cleaner::scan_dev_processes,

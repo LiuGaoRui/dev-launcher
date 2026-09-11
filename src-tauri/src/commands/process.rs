@@ -26,7 +26,7 @@ use crate::process::build::run_build;
 use crate::process::kill::kill_process_tree;
 use crate::process::monitor::{collect_tcp_sockets, find_port_owner, probe_one, ProjectStatus};
 use crate::process::registry::{ProcessSnapshot, RunningProcess};
-use crate::process::spawn::{spawn_command, start_log_path, truncate_log};
+use crate::process::spawn::{append_log_line, spawn_command, start_log_path, truncate_log};
 use crate::process::StartResult;
 use crate::services::ProjectService;
 use crate::state::AppState;
@@ -51,6 +51,11 @@ pub async fn start_project<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResult<
     let pool = db::pool(&app)?;
     let project = ProjectService::get(&pool, id).await?;
     let state = app.state::<AppState>();
+
+    // per-project 启动锁：下面的「校验 → truncate → spawn → 入 registry」必须原子，
+    // 否则两次并发启动都能通过 contains 校验，各自 truncate 同一 start.log。
+    let start_lock = state.start_lock(id);
+    let _guard = start_lock.lock().await;
 
     // 校验未运行（registry 内本会话进程，或 DB last_pid 指向的外部进程仍存活）
     if state.registry().contains(id) {
@@ -78,12 +83,18 @@ pub async fn start_project<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResult<
     }
 
     // 计算启动日志路径 + spawn 前 truncate（保证 start.log 只含本次启动输出）
-    let log_path = start_log_path(state.logs_root(), &project.name)?;
+    let log_path = start_log_path(state.logs_root(), id)?;
     truncate_log(&log_path);
     let started_at = now_iso();
 
-    // spawn 进程
-    let (child, pid) = spawn_command(&project, &log_path)?;
+    // spawn 进程；失败时把原因写进已清空的 start.log，避免日志一片空白
+    let (child, pid) = match spawn_command(&project, &log_path) {
+        Ok(v) => v,
+        Err(e) => {
+            append_log_line(&log_path, &format!("# [项目管理器] 启动失败: {e}"));
+            return Err(e);
+        }
+    };
 
     // 入 registry（已二次校验 contains，但 insert 仍会校验冲突）
     let proc = RunningProcess {
@@ -500,7 +511,7 @@ async fn fetch_all_expected_ports(
     Ok(map)
 }
 
-/// 批量取项目的运行时信息（last_pid / last_start_time / name→log_path），
+/// 批量取项目的运行时信息（last_pid / last_start_time → log_path），
 /// 返回 `ProcessSnapshot` 供 probe 循环直接使用。
 ///
 /// - `ids` 非空：查 `WHERE id IN (...)` 的指定项目
@@ -512,14 +523,12 @@ async fn fetch_runtime_info(
 ) -> AppResult<HashMap<i64, ProcessSnapshot>> {
     let rows: Vec<_> = if ids.is_empty() {
         // 空 = 全量扫描：查全部 last_pid 非空的项目
-        sqlx::query(
-            "SELECT id, name, last_pid, last_start_time FROM project WHERE last_pid IS NOT NULL",
-        )
-        .fetch_all(pool)
-        .await?
+        sqlx::query("SELECT id, last_pid, last_start_time FROM project WHERE last_pid IS NOT NULL")
+            .fetch_all(pool)
+            .await?
     } else {
         let sql = format!(
-            "SELECT id, name, last_pid, last_start_time FROM project WHERE id IN ({})",
+            "SELECT id, last_pid, last_start_time FROM project WHERE id IN ({})",
             in_placeholders(ids.len())
         );
         let mut q = sqlx::query(&sql);
@@ -532,11 +541,10 @@ async fn fetch_runtime_info(
     let mut map = HashMap::with_capacity(rows.len());
     for row in rows {
         let id: i64 = row.try_get("id")?;
-        let name: String = row.try_get("name")?;
         let last_pid: Option<i64> = row.try_get("last_pid")?;
         let last_start_time: Option<String> = row.try_get("last_start_time")?;
         if let Some(pid) = last_pid {
-            let log_path = crate::logs::paths::log_path_of(logs_root, &name, crate::logs::paths::LogType::Start);
+            let log_path = crate::logs::paths::log_path_of(logs_root, id, crate::logs::paths::LogType::Start);
             map.insert(
                 id,
                 ProcessSnapshot {

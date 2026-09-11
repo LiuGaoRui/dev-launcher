@@ -70,7 +70,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
-  logStore.stopLive()
+  // reset 内部已 stopLive（作废 token + 后端退订）
   logStore.reset()
 })
 
@@ -102,7 +102,7 @@ async function handleClear() {
     positiveText: '清空',
     negativeText: '取消',
     onPositiveClick: async () => {
-      await logStore.clear(projectId.value)
+      await logStore.clear(projectId.value, logType.value)
     },
   })
 }

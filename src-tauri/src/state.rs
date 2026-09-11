@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager};
 
 use crate::error::AppResult;
+use crate::logs::subscription::LogSubRegistry;
 use crate::process::ProcessRegistry;
 
 /// 后台构建状态（供前端轮询展示构建按钮状态图标）。
@@ -29,6 +30,8 @@ pub struct BuildState {
 /// - `data_dir` / `logs_root`：路径常量
 /// - `registry`：运行中进程注册表
 /// - `builds`：后台构建状态表（项目 id → BuildState）
+/// - `log_subs`：日志订阅注册表（显式取消 tail task，ADR-006）
+/// - `start_locks`：per-project 启动互斥，避免并发启动重复 truncate 日志
 /// - `system`：持久化 sysinfo System，监控 probe 时 refresh 形成 CPU 基线
 ///   （sysinfo cpu_usage 需两次 refresh 间隔才准确，故全程复用同一实例）
 pub struct AppState {
@@ -46,6 +49,10 @@ struct Inner {
     registry: ProcessRegistry,
     /// 后台构建状态表：project_id → BuildState（多项目可同时构建）
     builds: Mutex<HashMap<i64, BuildState>>,
+    /// 日志订阅注册表（Arc 共享给 tail task 自清理）
+    log_subs: Arc<LogSubRegistry>,
+    /// per-project 启动锁：project_id → tokio Mutex（跨 await 持有）
+    start_locks: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
     /// 持久化 sysinfo，监控探测用
     system: Mutex<sysinfo::System>,
 }
@@ -68,6 +75,8 @@ impl AppState {
                 logs_root,
                 registry: ProcessRegistry::new(),
                 builds: Mutex::new(HashMap::new()),
+                log_subs: Arc::new(LogSubRegistry::new()),
+                start_locks: Mutex::new(HashMap::new()),
                 system: Mutex::new(sysinfo::System::new()),
             }),
         })
@@ -90,6 +99,26 @@ impl AppState {
     /// 后台构建状态表（共享引用，内部 Mutex 保护）。
     pub fn builds(&self) -> &Mutex<HashMap<i64, BuildState>> {
         &self.inner.builds
+    }
+
+    /// 日志订阅注册表（clone `Arc`，供命令层登记与 tail task 自清理共享）。
+    pub fn log_subs(&self) -> Arc<LogSubRegistry> {
+        self.inner.log_subs.clone()
+    }
+
+    /// 取某项目的启动锁（不存在则创建）。
+    ///
+    /// 锁对象是 `tokio::sync::Mutex`，可跨 await 持有；本方法只在 std Mutex 内
+    /// 取/建 entry，不跨 await，故不会阻塞运行时。
+    pub fn start_lock(&self, project_id: i64) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self
+            .inner
+            .start_locks
+            .lock()
+            .expect("start locks mutex poisoned");
+        map.entry(project_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// 持久化 sysinfo System（监控探测用）。

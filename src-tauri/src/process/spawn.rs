@@ -107,39 +107,27 @@ pub fn inject_java_utf8(start_cmd: &str) -> String {
     start_cmd.to_string()
 }
 
-/// 清洗项目名为合法目录名：非 [A-Za-z0-9_\u4e00-\u9fa5-] 字符替换为 `_`。
-///
-/// 保留中文字符（\u4e00-\u9fa5 CJK 统一表意文字基本区），Windows 文件系统支持。
-///
-/// 跨模块复用：spawn（写日志）与 logs/paths（读/列日志）须用同一规则拼目录名，
-/// 否则读写路径会错位。故提升为 pub。
-pub fn sanitize_name(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric()
-                || c == '_'
-                || c == '-'
-                || ('\u{4e00}'..='\u{9fa5}').contains(&c)
-            {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-/// 计算项目启动日志文件路径：`{logs_root}/{sanitized_name}/start.log`
+/// 计算项目启动日志文件路径：`{logs_root}/{project_id}/start.log`
 ///
 /// 同时确保目录存在。返回日志文件路径。
 /// 启动日志固定单文件（start.log），由 start_project 在 spawn 前 truncate，
 /// 故只含「本次」启动输出；tail 实时订阅可完整看到。
-pub fn start_log_path(logs_root: &Path, project_name: &str) -> AppResult<PathBuf> {
-    let path = crate::logs::paths::log_path_of(logs_root, project_name, crate::logs::paths::LogType::Start);
+pub fn start_log_path(logs_root: &Path, project_id: i64) -> AppResult<PathBuf> {
+    let path = crate::logs::paths::log_path_of(logs_root, project_id, crate::logs::paths::LogType::Start);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     Ok(path)
+}
+
+/// 往日志文件追加一行（create + append，best-effort）。
+///
+/// 用于「执行前已 truncate，但 spawn 失败」的场景：把错误原因写进日志文件，
+/// 避免用户打开日志看到空白、误以为没报错。
+pub fn append_log_line(path: &Path, line: &str) {
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{line}");
+    }
 }
 
 /// Truncate 一个日志文件：文件存在则清空内容（保留文件本身），不存在视为 no-op。
@@ -237,21 +225,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sanitize_replaces_illegal_chars() {
-        assert_eq!(sanitize_name("HR 系统后端"), "HR_系统后端");
-        assert_eq!(sanitize_name("a/b:c*d"), "a_b_c_d");
-        assert_eq!(sanitize_name("normal-name_1"), "normal-name_1");
-        assert_eq!(sanitize_name("中文项目"), "中文项目");
-    }
-
-    #[test]
     fn start_log_path_layout() {
         let tmp = tempfile::tempdir().unwrap();
-        let file = start_log_path(tmp.path(), "HR 系统/后端").unwrap();
+        let file = start_log_path(tmp.path(), 7).unwrap();
         let dir = file.parent().unwrap();
         assert!(dir.exists());
         assert!(file.to_string_lossy().ends_with("start.log"));
-        assert!(dir.to_string_lossy().contains("HR_系统_后端"));
+        assert_eq!(dir.file_name().unwrap(), "7");
     }
 
     #[test]

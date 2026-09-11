@@ -47,36 +47,43 @@ MVP（开发计划 §八）全部就位：项目注册 / 启停 / 重启 / 构�
 4. **P2 AI 进程识别**：识别 Claude Code / Cursor 并关联项目
 5. **P2 项目依赖启动**：启动时检测 Redis/Nacos 等依赖
 
-## 五、构建架构（阶段 7 产出）
+## 五、构建架构（阶段 7 产出；2026-09-11 起构建输出落盘）
 
 ```
-build_project(id, onEvent: Channel) 入口
-   │ 取 project → 校验 build_cmd
-   └─ run_build(project, channel)
-        ├─ cmd /C <build_cmd> (piped stdout/stderr, CREATE_NO_WINDOW)
-        ├─ tokio::spawn pump_pipe(stdout) ─┐
-        ├─ tokio::spawn pump_pipe(stderr) ─┤  并发读 4KB 块（防死锁）
-        │   on_event.send(Stdout/Stderr) ◀┘  send 失败 → break（Channel GC → kill_on_drop 回收）
+build_project(id) 入口
+   │ 取 project → 预检 build_cmd 非空 → 原子标记 builds[id].running
+   └─ tokio::spawn { run_build(project, logs_root) → 写回 builds[id] 状态 }
+        ├─ truncate build.log
+        ├─ cmd /C <build_cmd> (stdout/stderr → append build.log, CREATE_NO_WINDOW)
         ├─ child.wait().await → exit code
-        ├─ on_event.send(Exit(code))
         └─ return BuildResult{exit_code, duration_ms}
+
+前端：轮询 get_build_status(id) 取 running/exit_code；
+      构建输出经 subscribe_log(id, "build") 以实时日志方式查看。
 ```
 
 **与 start/spawn 的区别**：
-- start（常驻）：stdout/stderr 追加写日志文件、Job Object 托管、入 registry
-- build（一次性）：piped 实时推 Channel、不入 registry、kill_on_drop 兜底、返回退出码
+- start（常驻）：不设 kill_on_drop、入 registry、DB 记 last_pid
+- build（一次性）：kill_on_drop 兜底、不入 registry、退出码写入内存 builds 表
 
-## 六、日志架构（阶段 6 产出）
+## 六、日志架构（阶段 6 产出；2026-09-11 重新设计，见 ADR-006）
 
 ```
-子进程 stdout/stderr → append 落盘 {logs_root}/{name}/{YYYYMMDD}.log
-   │
-subscribe_log(projectId, onEvent: Channel)
-   └─ spawn_tail_task(log_path, channel)
-        ├─ push_all_available(offset=0) → 首推今日全部
-        └─ loop (250ms): size<offset? 重置重读 / size>offset? 推增量 / send Err? break
-        channel.send(LogChunk{offset, text}) ──▶ 前端 onmessage → store.lines 追加
+子进程 stdout/stderr → append 落盘 {logs_root}/{project_id}/{start|build}.log
+   │  （每次启动/构建前 truncate，只含本次输出）
+subscribe_log(projectId, logType, onEvent) → 返回 sub_id
+   └─ spawn_tail_task(log_path, sub_id, cancel, registry, channel)
+        ├─ push_all_available(offset=0) → 首推已有全部
+        ├─ loop (250ms): cancel? 退出 / size<offset? 重置重读 /
+        │                size>offset? 推增量 / send Err? 退出
+        ├─ 退出时 registry.finish(sub_id) 自清理登记项
+        └─ channel.send(LogChunk{sub_id, offset, text})
+              ──▶ 前端 onmessage：token + sub_id 双重校验通过才追加到 lines
+unsubscribe_log(sub_id) → 置 cancel 标志 → task 下一轮询节点退出
 ```
+
+**隔离保证**：目录按项目 id（不同项目绝不共用文件，消除同名项目串写）；
+每次订阅分配唯一 sub_id，前端 token 守卫丢弃过期订阅的推送。
 
 ## 七、监控架构（阶段 5 产出）
 
@@ -90,10 +97,11 @@ subscribe_log(projectId, onEvent: Channel)
 ## 八、关键决策备忘（详见 docs/adr/）
 
 - **ADR-001 进程管理**：不用 `tauri-plugin-shell`，用 `tokio::process` + Windows Job Object 自管
-- **ADR-002 日志/构建推送**：用 `tauri::ipc::Channel`（不用事件系统），前端 GC Channel 自动退订 ✅ 阶段 6/7 落地
+- **ADR-002 日志/构建推送**：用 `tauri::ipc::Channel`（不用事件系统）✅ 阶段 6/7 落地；其中「GC 自动退订」部分已被 ADR-006 取代
 - **ADR-003 端口探测**：`netstat2` 查监听者 + `TcpStream::connect` 探活双重检测
 - **ADR-004 数据库**：用 `tauri-plugin-sql`（SQLite）做迁移注册 + 连接管理
 - **ADR-005 DB 服务层访问**：从 `DbPool::Sqlite` 取 `sqlx::Pool<Sqlite>` 直查
+- **ADR-006 日志订阅生命周期与隔离**：日志目录改项目 id 键（消除同名串写）；`subscribe_log` 返回 sub_id + 显式 `unsubscribe_log`；`LogChunk` 带 sub_id，前端 token 守卫丢弃过期推送
 - **阶段 3 决策**：目录选择用前端 dialog 插件 `open({directory})` 而非 Rust `pick_directory` 命令
 - **阶段 5 决策**：监控指标聚合整树（非仅根进程）；端口做归属校验（防 R3）；固定 3s 轮询（不做启动宽限期）
 - **阶段 6 决策**：实时起点=今日全部(offset 0)；固定 250ms 轮询(不引 notify)；截断自动重读；跳过 log_ref 表扫文件系统

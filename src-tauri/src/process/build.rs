@@ -29,24 +29,14 @@ pub struct BuildResult {
 
 /// 执行项目构建命令：stdout/stderr 重定向到 build.log，跑完返回退出码与耗时。
 ///
-/// - `build_cmd` 为空 → 返回 `AppError::Process`
+/// - `build_cmd` 为空 → 写错误行到 build.log 后返回 `AppError::Process`
 /// - 构建开始前 truncate `build.log`（保证只含本次输出）
 /// - 跑完即退出，不入 registry
 pub async fn run_build(project: &Project, logs_root: &Path) -> AppResult<BuildResult> {
-    let build_cmd = project.build_cmd.as_ref().ok_or_else(|| {
-        AppError::Process(format!("项目「{}」未配置构建命令", project.name))
-    })?;
-    if build_cmd.trim().is_empty() {
-        return Err(AppError::Process(format!(
-            "项目「{}」构建命令为空",
-            project.name
-        )));
-    }
-
     // 构建日志路径 + 构建前 truncate（保证只含本次输出）
     let log_path = crate::logs::paths::log_path_of(
         logs_root,
-        &project.name,
+        project.id,
         crate::logs::paths::LogType::Build,
     );
     // 确保目录存在（首次构建时目录可能还没建）
@@ -54,6 +44,25 @@ pub async fn run_build(project: &Project, logs_root: &Path) -> AppResult<BuildRe
         std::fs::create_dir_all(parent)?;
     }
     crate::process::spawn::truncate_log(&log_path);
+
+    // 校验构建命令；失败时把原因写进日志，避免用户打开日志只看到空白
+    let build_cmd = match project.build_cmd.as_deref() {
+        Some(c) if !c.trim().is_empty() => c,
+        Some(_) => {
+            crate::process::spawn::append_log_line(&log_path, "# [项目管理器] 构建命令为空");
+            return Err(AppError::Process(format!(
+                "项目「{}」构建命令为空",
+                project.name
+            )));
+        }
+        None => {
+            crate::process::spawn::append_log_line(&log_path, "# [项目管理器] 未配置构建命令");
+            return Err(AppError::Process(format!(
+                "项目「{}」未配置构建命令",
+                project.name
+            )));
+        }
+    };
 
     // 打开两个 append 句柄（stdout/stderr 各一），OS 负责交错写入
     let (stdout, stderr) = crate::process::spawn::open_log_stdio(&log_path)?;
@@ -73,9 +82,19 @@ pub async fn run_build(project: &Project, logs_root: &Path) -> AppResult<BuildRe
     cmd.creation_flags(crate::process::spawn::CREATE_NO_WINDOW);
 
     let start = Instant::now();
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| AppError::Process(format!("构建「{}」启动失败: {e}", project.name)))?;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            crate::process::spawn::append_log_line(
+                &log_path,
+                &format!("# [项目管理器] 构建进程启动失败: {e}"),
+            );
+            return Err(AppError::Process(format!(
+                "构建「{}」启动失败: {e}",
+                project.name
+            )));
+        }
+    };
 
     let status = child.wait().await.map_err(|e| {
         AppError::Process(format!("构建「{}」等待退出失败: {e}", project.name))

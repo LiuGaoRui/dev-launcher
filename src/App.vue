@@ -52,7 +52,10 @@ const themeOverrides = computed<GlobalThemeOverrides>(() => ({
           <AppShell>
             <RouterView v-slot="{ Component }">
               <KeepAlive :include="['ProjectList']">
-                <component :is="Component" />
+                <!-- 以 fullPath 为 key：/projects/1 → /projects/2 会重建详情页实例，
+                     避免复用实例导致日志订阅停留在上一个项目（ProjectList 的
+                     fullPath 恒定，KeepAlive 缓存不受影响） -->
+                <component :is="Component" :key="$route.fullPath" />
               </KeepAlive>
             </RouterView>
           </AppShell>
