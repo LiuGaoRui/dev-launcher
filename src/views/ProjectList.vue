@@ -205,6 +205,11 @@ function handleBuild(p: Project) {
   void buildStore.startBuild(p.id)
 }
 
+/** 停止构建：后端 taskkill 杀构建进程树（构建中卡片按钮自动切换为「停止构建」） */
+function handleStopBuild(p: Project) {
+  void buildStore.stopBuild(p.id)
+}
+
 /**
  * 点击「重启」：停止 → 构建 → 启动 三步串行。
  * - 先停再构建：旧进程会占着 build 产物文件（如 dist/、jar，Windows 文件锁）
@@ -396,6 +401,7 @@ async function stopAll() {
         @stop="handleStop(p)"
         @restart="handleRestart(p)"
         @build="handleBuild(p)"
+        @stop-build="handleStopBuild(p)"
         @log="handleLog(p)"
         @edit="openEdit(p)"
         @delete="handleDelete(p)"

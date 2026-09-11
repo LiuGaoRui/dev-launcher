@@ -1,16 +1,16 @@
 <script setup lang="ts">
 // 项目卡片底部的操作条。
-// 按钮：启动/停止 | 重启 | 构建(+状态图标) | 日志 | 编辑 | 删除
+// 按钮：启动/停止 | 重启 | 构建(+状态图标)/停止构建 | 日志 | 编辑 | 删除
 //
 // 「重启」= 停止 → 构建（可选）→ 启动 三步串行（见 ProjectList.handleRestart）。
 // 有 build_cmd 走完整三步；无 build_cmd（纯 dev 模式）走停止 → 启动。
 //
 // 构建状态图标（由父组件用 buildState prop 传入）：
-//   running → 旋转图标；失败(exit_code!=0 且非 running) → 红色 X；否则无图标。
+//   running → 按钮变为「停止构建」（杀进程树）；失败(exit_code!=0 且非 running) → 红色 X；否则无图标。
 
 import { computed } from 'vue'
 import { NButton, NIcon } from 'naive-ui'
-import { RefreshOutline, CloseCircle } from '@vicons/ionicons5'
+import { CloseCircle, StopOutline } from '@vicons/ionicons5'
 import type { BuildState } from '@/types/project'
 
 const props = defineProps<{
@@ -28,6 +28,7 @@ const emit = defineEmits<{
   stop: []
   restart: []
   build: []
+  stopBuild: []
   log: []
   edit: []
   delete: []
@@ -73,7 +74,25 @@ const buildFailed = computed(
     >
       重启
     </NButton>
+    <!-- 构建中：变为「停止构建」按钮（兜底构建命令进程树不退出的场景）。
+         刻意不受 busy 禁用：重启流程卡在构建阶段时它是唯一的救援出口 -->
     <NButton
+      v-if="buildRunning"
+      size="tiny"
+      type="warning"
+      tertiary
+      title="强制终止构建进程树"
+      @click="emit('stopBuild')"
+    >
+      <template #icon>
+        <NIcon>
+          <StopOutline />
+        </NIcon>
+      </template>
+      停止构建
+    </NButton>
+    <NButton
+      v-else
       size="tiny"
       tertiary
       :disabled="busy || !canBuild || buildRunning"
@@ -81,12 +100,8 @@ const buildFailed = computed(
       @click="emit('build')"
     >
       <template #icon>
-        <!-- 构建中：旋转图标 -->
-        <NIcon v-if="buildRunning" class="spin">
-          <RefreshOutline />
-        </NIcon>
         <!-- 构建失败：红色 X -->
-        <NIcon v-else-if="buildFailed" class="fail">
+        <NIcon v-if="buildFailed" class="fail">
           <CloseCircle />
         </NIcon>
       </template>
@@ -106,15 +121,6 @@ const buildFailed = computed(
   gap: 6px;
   align-items: center;
   flex-wrap: wrap;
-}
-/* 构建中旋转动画 */
-.spin {
-  animation: rotate 1.2s linear infinite;
-}
-@keyframes rotate {
-  to {
-    transform: rotate(360deg);
-  }
 }
 /* 构建失败图标红色 */
 .fail {

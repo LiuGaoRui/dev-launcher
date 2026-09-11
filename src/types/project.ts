@@ -87,6 +87,8 @@ export interface BuildState {
   exit_code: number
   /** 耗时（ms，构建结束才填） */
   duration_ms: number
-  /** 错误信息（命令本身抛错时填，如未配 build_cmd） */
+  /** 错误信息（命令本身抛错时填，如未配 build_cmd、超时） */
   error: string
+  /** 是否被 stop_build 手动取消（取消不弹错误提示） */
+  canceled?: boolean
 }

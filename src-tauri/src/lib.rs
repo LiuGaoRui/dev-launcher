@@ -52,6 +52,7 @@ pub fn run() {
             commands::process::start_project,
             commands::process::stop_project,
             commands::process::build_project,
+            commands::process::stop_build,
             commands::process::get_build_status,
             commands::process::probe_statuses,
             // scan_root

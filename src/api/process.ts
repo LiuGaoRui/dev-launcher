@@ -1,6 +1,6 @@
 // process 命令薄包装。
 // 对齐 src-tauri/src/commands/process.rs：
-//   start_project / stop_project / build_project / get_build_status。
+//   start_project / stop_project / build_project / stop_build / get_build_status。
 
 import type { StartResult, BuildState } from '@/types/project'
 import { invokeCmd } from './invoke'
@@ -22,6 +22,11 @@ export function stopProject(id: number): Promise<void> {
  */
 export function buildProject(id: number): Promise<void> {
   return invokeCmd<void>('build_project', { id })
+}
+
+/** 停止构建：taskkill 杀构建进程树，状态置为已取消（canceled=true） */
+export function stopBuild(id: number): Promise<void> {
+  return invokeCmd<void>('stop_build', { id })
 }
 
 /** 查询某项目的构建状态（供轮询展示构建按钮状态图标） */

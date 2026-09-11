@@ -39,6 +39,7 @@ const emit = defineEmits<{
   stop: []
   restart: []
   build: []
+  stopBuild: []
   log: []
   edit: []
   delete: []
@@ -156,6 +157,7 @@ function urlOf(port: string): string {
         @stop="emit('stop')"
         @restart="emit('restart')"
         @build="emit('build')"
+        @stop-build="emit('stopBuild')"
         @log="emit('log')"
         @edit="emit('edit')"
         @delete="emit('delete')"

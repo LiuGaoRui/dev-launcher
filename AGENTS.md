@@ -74,7 +74,7 @@ src/                          # Vue 3 前端
 └── router/index.ts           # hash 路由：/（重定向）, /projects, /projects/:id
 
 src-tauri/src/                # Rust 后端
-├── commands/                 # IPC handler（薄层，30 个命令，8 个文件）
+├── commands/                 # IPC handler（薄层，31 个命令，8 个文件）
 ├── services/                 # 业务逻辑（project_service, detect_service, scan_root_service, cleaner_lock_service, port_ignore_service，含单元测试）
 ├── process/                  # 进程管理：spawn, registry, tree, monitor, build, kill, dev_scan, port_scan, trim；job_object 已退役
 ├── logs/                     # 日志：paths（按项目 id 分目录）, tail（轮询增量 + Channel 推送）, subscription（订阅注册表）

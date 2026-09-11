@@ -8,13 +8,15 @@
 //!
 //! 调用约定：`commands::process::build_project` 用 tokio::spawn 在后台跑本函数，
 //! 命令本身立即返回；前端轮询 `get_build_status` 获取 running/exit_code。
+//! 构建卡死可经 `stop_build` 杀进程树取消；超过 `BUILD_TIMEOUT` 自动画树兜底。
 
 use std::path::Path;
 use std::process::Stdio;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tokio::process::Command;
+use tokio::sync::oneshot;
 use tracing::debug;
 
 use crate::error::{AppError, AppResult};
@@ -27,12 +29,26 @@ pub struct BuildResult {
     pub duration_ms: u64,
 }
 
+/// 构建超时上限：超时强制杀进程树并以失败收场。
+///
+/// 兜底场景：构建命令本体已成功但进程树不退出（如 Next.js 16 Turbopack
+/// 打印完路由表后 worker 进程不退出），避免前端永远显示构建中。
+/// 取 1 小时以覆盖大型 Java 项目的全量打包。
+const BUILD_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
 /// 执行项目构建命令：stdout/stderr 重定向到 build.log，跑完返回退出码与耗时。
 ///
 /// - `build_cmd` 为空 → 写错误行到 build.log 后返回 `AppError::Process`
 /// - 构建开始前 truncate `build.log`（保证只含本次输出）
 /// - 跑完即退出，不入 registry
-pub async fn run_build(project: &Project, logs_root: &Path) -> AppResult<BuildResult> {
+/// - `pid_tx`：spawn 成功即上报进程树根 pid，供 stop_build 杀树；
+///   接收方已放弃（stop 来得比 spawn 还早）时发送失败可安全忽略
+/// - 超过 [`BUILD_TIMEOUT`] 未退出 → taskkill 杀树并返回超时错误
+pub async fn run_build(
+    project: &Project,
+    logs_root: &Path,
+    pid_tx: oneshot::Sender<u32>,
+) -> AppResult<BuildResult> {
     // 构建日志路径 + 构建前 truncate（保证只含本次输出）
     let log_path = crate::logs::paths::log_path_of(
         logs_root,
@@ -95,13 +111,44 @@ pub async fn run_build(project: &Project, logs_root: &Path) -> AppResult<BuildRe
             )));
         }
     };
+    let pid = child
+        .id()
+        .ok_or_else(|| AppError::Process(format!("构建「{}」无法获取 PID", project.name)))?;
+    // spawn 成功即上报 pid（接收方已放弃时忽略发送失败）
+    let _ = pid_tx.send(pid);
 
-    let status = child.wait().await.map_err(|e| {
-        AppError::Process(format!("构建「{}」等待退出失败: {e}", project.name))
-    })?;
+    // 等待退出，超时杀树兜底
+    let status = match tokio::time::timeout(BUILD_TIMEOUT, child.wait()).await {
+        Ok(res) => res.map_err(|e| {
+            AppError::Process(format!("构建「{}」等待退出失败: {e}", project.name))
+        })?,
+        Err(_) => {
+            // 超时：强制杀整棵进程树（含 cmd/pnpm/node worker 等），回收后报错
+            let _ = crate::process::kill::kill_process_tree(pid).await;
+            let _ = child.wait().await;
+            let mins = BUILD_TIMEOUT.as_secs() / 60;
+            crate::process::spawn::append_log_line(
+                &log_path,
+                &format!("# [项目管理器] 构建超时（{mins} 分钟），已强制终止进程树"),
+            );
+            return Err(AppError::Process(format!(
+                "构建「{}」超时（{mins} 分钟），已强制终止进程树",
+                project.name
+            )));
+        }
+    };
 
     let exit_code = status.code().unwrap_or(-1);
     let duration_ms = start.elapsed().as_millis() as u64;
+    // 收场标记行：构建命令自身打完就没了（如 next build 止于路由表图例），
+    // 追加一行让日志末尾自解释（结果 + 耗时），tail 订阅实时可见
+    crate::process::spawn::append_log_line(
+        &log_path,
+        &format!(
+            "# [项目管理器] 构建结束：exit_code={exit_code}，耗时 {:.1}s",
+            duration_ms as f64 / 1000.0
+        ),
+    );
     debug!(
         "构建「{}」完成: exit_code={}, duration_ms={}",
         project.name, exit_code, duration_ms

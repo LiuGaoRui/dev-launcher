@@ -8,7 +8,7 @@
 
 import { defineStore } from 'pinia'
 import { ref, type Ref } from 'vue'
-import { buildProject, getBuildStatus } from '@/api/process'
+import { buildProject, getBuildStatus, stopBuild } from '@/api/process'
 import type { BuildState } from '@/types/project'
 import { safeCall } from '@/api/invoke'
 import { createDiscreteApi } from 'naive-ui'
@@ -18,7 +18,7 @@ const { message } = createDiscreteApi(['message'])
 const POLL_INTERVAL_MS = 1000
 
 function defaultState(): BuildState {
-  return { running: false, exit_code: 0, duration_ms: 0, error: '' }
+  return { running: false, exit_code: 0, duration_ms: 0, error: '', canceled: false }
 }
 
 interface BuildEntry {
@@ -42,7 +42,7 @@ export const useBuildStore = defineStore('build', () => {
 
   async function startBuild(id: number, onDone?: (exitCode: number) => void) {
     const entry = ensureEntry(id)
-    entry.state.value = { running: true, exit_code: 0, duration_ms: 0, error: '' }
+    entry.state.value = { running: true, exit_code: 0, duration_ms: 0, error: '', canceled: false }
 
     const [, err] = await safeCall(() => buildProject(id))
     if (err) {
@@ -53,6 +53,12 @@ export const useBuildStore = defineStore('build', () => {
     }
 
     pollStatus(id, onDone)
+  }
+
+  /** 手动停止构建：后端杀构建进程树，状态经轮询自然收敛为 canceled 终态 */
+  async function stopBuildById(id: number) {
+    const [, err] = await safeCall(() => stopBuild(id))
+    if (err) message.error(`停止构建失败：${err}`)
   }
 
   function pollStatus(id: number, onDone?: (exitCode: number) => void) {
@@ -66,7 +72,9 @@ export const useBuildStore = defineStore('build', () => {
         entry.state.value = { ...s }
         if (!s.running) {
           stopPoll(id)
-          if (s.error) {
+          if (s.canceled) {
+            // 手动停止：正常操作，不弹错误
+          } else if (s.error) {
             message.error(`构建失败：${s.error}`)
           } else if (s.exit_code !== 0) {
             message.error(`构建失败（退出码 ${s.exit_code}）`)
@@ -101,5 +109,5 @@ export const useBuildStore = defineStore('build', () => {
     }
   }
 
-  return { getState, startBuild, stopPoll, clearAllTimers }
+  return { getState, startBuild, stopBuild: stopBuildById, stopPoll, clearAllTimers }
 })

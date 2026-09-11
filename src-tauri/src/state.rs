@@ -20,9 +20,16 @@ pub struct BuildState {
     pub exit_code: i32,
     /// 耗时（ms，构建结束才填）
     pub duration_ms: u64,
-    /// 错误信息（命令本身抛错时填，如未配 build_cmd、启动失败）
+    /// 错误信息（命令本身抛错时填，如未配 build_cmd、启动失败、超时）
     #[serde(default)]
     pub error: String,
+    /// 是否被 stop_build 手动取消（后台任务写回结果时据此跳过覆盖）
+    #[serde(default)]
+    pub canceled: bool,
+    /// 构建进程树根 pid（cmd.exe），running 期间有效，供 stop_build 杀树；
+    /// 纯后端内部状态，不下发前端
+    #[serde(skip_serializing)]
+    pub pid: Option<u32>,
 }
 
 /// 全局共享状态

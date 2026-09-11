@@ -1,4 +1,4 @@
-//! process 命令薄层：start_project / stop_project / build_project / get_build_status / probe_statuses
+//! process 命令薄层：start_project / stop_project / build_project / stop_build / get_build_status / probe_statuses
 //!
 //! 进程**脱离**管理器生命周期：spawn 不挂 Job Object、不设 kill_on_drop，
 //! 关闭软件后子进程继续运行。停止用 `taskkill /F /T` 杀整树；
@@ -231,16 +231,49 @@ pub async fn build_project<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResult<
                 exit_code: 0,
                 duration_ms: 0,
                 error: String::new(),
+                canceled: false,
+                pid: None,
             },
         );
     }
 
-    // 后台跑 run_build：app clone 持有 AppState 引用，任务结束写回状态
+    // 后台跑 run_build：app clone 持有 AppState 引用，任务结束写回状态。
+    // pid 经 oneshot 上报：先收 pid 写入状态表（供 stop_build 杀树）再等结果；
+    // stop_build 比 pid 上报还早时（canceled 已置位），由本任务补杀进程树。
     let app2 = app.clone();
     tokio::spawn(async move {
-        let result = run_build(&project, &logs_root).await;
+        let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<u32>();
+        let logs_root2 = logs_root.to_path_buf();
+        let build_task = tokio::spawn(async move { run_build(&project, &logs_root2, pid_tx).await });
+
+        // 收 pid：写入状态表；stop 已先到则直接补杀（run_build 的 wait 随之返回，结果被丢弃）
+        if let Ok(pid) = pid_rx.await {
+            let kill_now = {
+                let state2 = app2.state::<AppState>();
+                let mut builds = state2.builds().lock().expect("builds mutex poisoned");
+                match builds.get_mut(&id) {
+                    Some(bs) if bs.canceled => true,
+                    Some(bs) if bs.running => {
+                        bs.pid = Some(pid);
+                        false
+                    }
+                    _ => false,
+                }
+            };
+            if kill_now {
+                let _ = kill_process_tree(pid).await;
+            }
+        }
+
+        let result = build_task
+            .await
+            .unwrap_or_else(|e| Err(AppError::Process(format!("构建任务异常终止: {e}"))));
         let state2 = app2.state::<AppState>();
         let mut builds = state2.builds().lock().expect("builds mutex poisoned");
+        // stop_build 已写终态（canceled）→ 后续结果（自然退出/超时报错）一律丢弃
+        if builds.get(&id).map(|bs| bs.canceled).unwrap_or(false) {
+            return;
+        }
         match result {
             Ok(r) => {
                 builds.insert(
@@ -250,6 +283,8 @@ pub async fn build_project<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResult<
                         exit_code: r.exit_code,
                         duration_ms: r.duration_ms,
                         error: String::new(),
+                        canceled: false,
+                        pid: None,
                     },
                 );
             }
@@ -261,12 +296,69 @@ pub async fn build_project<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResult<
                         exit_code: -1,
                         duration_ms: 0,
                         error: e.to_string(),
+                        canceled: false,
+                        pid: None,
                     },
                 );
             }
         }
     });
 
+    Ok(())
+}
+
+/// 停止构建：taskkill /F /T 杀构建进程树（含 cmd/pnpm/node worker 等），状态置为已取消。
+///
+/// 兜底场景：构建命令本体已成功但进程树不退出（如某些前端构建工具完成后
+/// worker 进程残留），导致前端永远显示构建中且无法重新构建。
+///
+/// 与后台写回任务的竞态协调：先置 canceled 再杀树，后台任务写回时发现
+/// canceled 即丢弃结果；杀树失败则回滚 canceled 保持 running，可重试。
+#[tauri::command]
+pub async fn stop_build<R: Runtime>(app: AppHandle<R>, id: i64) -> AppResult<()> {
+    let state = app.state::<AppState>();
+
+    // 标记取消并取 pid（启动极早期 pid 可能尚未上报，杀树由后台任务兜底补刀）
+    let pid = {
+        let mut builds = state.builds().lock().expect("builds mutex poisoned");
+        let bs = builds
+            .get_mut(&id)
+            .filter(|bs| bs.running)
+            .ok_or_else(|| AppError::NotRunning(id))?;
+        bs.canceled = true;
+        bs.pid.take()
+    };
+
+    if let Some(pid) = pid {
+        if let Err(e) = kill_process_tree(pid).await {
+            // 杀失败：回滚取消标记，状态保持 running，前端可重试停止
+            let mut builds = state.builds().lock().expect("builds mutex poisoned");
+            if let Some(bs) = builds.get_mut(&id) {
+                bs.canceled = false;
+                bs.pid = Some(pid);
+            }
+            return Err(e);
+        }
+    }
+
+    // 写终态（后台任务见 canceled 已跳过写回）；同时给 build.log 补收场标记行，
+    // 否则被杀的构建命令不会留下任何输出，日志末尾无法看出是被手动终止的
+    let mut builds = state.builds().lock().expect("builds mutex poisoned");
+    if let Some(bs) = builds.get_mut(&id) {
+        if bs.running {
+            bs.running = false;
+            bs.exit_code = -1;
+            bs.duration_ms = 0;
+            bs.error = String::from("已手动停止");
+            bs.pid = None;
+            let log_path = crate::logs::paths::log_path_of(
+                state.logs_root(),
+                id,
+                crate::logs::paths::LogType::Build,
+            );
+            append_log_line(&log_path, "# [项目管理器] 构建已手动停止，进程树已强制终止");
+        }
+    }
     Ok(())
 }
 
