@@ -17,6 +17,7 @@ use regex::Regex;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{DetectedProject, LaunchScheme, ProjectType};
+use crate::process::spawn::JAVA_UTF8_OPT;
 
 /// 扫描跳过的目录名（不分大小写匹配）。
 ///
@@ -618,6 +619,8 @@ impl DetectService {
         // start_cmd = 只 java -jar（秒级启动，不含打包）
         // - ZIP layout：优先 release/（完整依赖），无则 target/（+ loader.path=./lib）
         // - 普通 layout：target/<jar>，路径从 root 相对（含空格加引号）
+        // 统一带上 {JAVA_UTF8_OPT}：JVM 默认字符集随启动环境变化（命令行启动在中文
+        // Windows 下为 GBK），显式指定后行为不再依赖「IDE 启动还是命令行启动」
         let jar_name_str = jar_name.as_deref().unwrap_or("app.jar");
         let start_cmd = if zip_layout {
             if let Some(rel) = release_rel {
@@ -626,7 +629,7 @@ impl DetectService {
                 } else {
                     format!("cd {rel} && ")
                 };
-                format!("{cd}{java_bin} -Dloader.path=./lib -jar {jar_name_str}")
+                format!("{cd}{java_bin} {JAVA_UTF8_OPT} -Dloader.path=./lib -jar {jar_name_str}")
             } else {
                 let cd = if mod_rel.is_empty() {
                     String::new()
@@ -635,7 +638,9 @@ impl DetectService {
                 } else {
                     format!("cd {mod_rel} && ")
                 };
-                format!("{cd}{java_bin} -Dloader.path=./lib -jar target/{jar_name_str}")
+                format!(
+                    "{cd}{java_bin} {JAVA_UTF8_OPT} -Dloader.path=./lib -jar target/{jar_name_str}"
+                )
             }
         } else {
             let prefix = if mod_rel.is_empty() {
@@ -644,9 +649,9 @@ impl DetectService {
                 format!("{mod_rel}/target/")
             };
             if prefix.contains(' ') {
-                format!("{java_bin} -jar \"{prefix}{jar_name_str}\"")
+                format!("{java_bin} {JAVA_UTF8_OPT} -jar \"{prefix}{jar_name_str}\"")
             } else {
-                format!("{java_bin} -jar {prefix}{jar_name_str}")
+                format!("{java_bin} {JAVA_UTF8_OPT} -jar {prefix}{jar_name_str}")
             }
         };
 
@@ -1660,8 +1665,11 @@ public class Helper {
         );
         assert_eq!(schemes.len(), 1);
         assert!(schemes[0].recommended);
-        // start_cmd 只有 java -jar（不含 package）
-        assert_eq!(schemes[0].start_cmd, "java -jar svc/target/app.jar");
+        // start_cmd 只有 java -jar（不含 package），且带 UTF-8 默认字符集
+        assert_eq!(
+            schemes[0].start_cmd,
+            "java -Dfile.encoding=UTF-8 -jar svc/target/app.jar"
+        );
         // build_cmd = mvn package
         assert_eq!(
             schemes[0].build_cmd.as_deref(),
@@ -1689,10 +1697,10 @@ public class Helper {
             .unwrap()
             .contains("mvn -f \"HanXiInfotech OA Sever/hmsoft-boot-jar/pom.xml\" clean package"),
             "expected quoted -f in build_cmd");
-        // start_cmd 的 jar 路径含空格 → 加引号
+        // start_cmd 的 jar 路径含空格 → 加引号（并按约定带 UTF-8 默认字符集）
         assert!(schemes[0]
             .start_cmd
-            .contains("java -jar \"HanXiInfotech OA Sever/hmsoft-boot-jar/target/purus.jar\""),
+            .contains("java -Dfile.encoding=UTF-8 -jar \"HanXiInfotech OA Sever/hmsoft-boot-jar/target/purus.jar\""),
             "expected quoted jar path in: {}", schemes[0].start_cmd);
     }
 
@@ -1712,7 +1720,7 @@ public class Helper {
         // start_cmd 从 release/ 运行
         assert_eq!(
             schemes[0].start_cmd,
-            "cd \"HanXiInfotech OA Sever/hmsoft-boot-jar/release\" && java -Dloader.path=./lib -jar purus.jar"
+            "cd \"HanXiInfotech OA Sever/hmsoft-boot-jar/release\" && java -Dfile.encoding=UTF-8 -Dloader.path=./lib -jar purus.jar"
         );
         // build_cmd 走聚合器 -pl -am
         assert!(schemes[0]
@@ -1736,7 +1744,9 @@ public class Helper {
         assert_eq!(schemes.len(), 1);
         assert!(schemes[0].recommended);
         // start_cmd 只 java -jar
-        assert!(schemes[0].start_cmd.contains("java -jar cli/target/"));
+        assert!(schemes[0]
+            .start_cmd
+            .contains("java -Dfile.encoding=UTF-8 -jar cli/target/"));
         // build_cmd = mvn package
         assert_eq!(
             schemes[0].build_cmd.as_deref(),
@@ -1758,7 +1768,10 @@ public class Helper {
         );
         assert_eq!(schemes.len(), 1);
         // start_cmd 用 target/（无子目录前缀）
-        assert_eq!(schemes[0].start_cmd, "java -jar target/app.jar");
+        assert_eq!(
+            schemes[0].start_cmd,
+            "java -Dfile.encoding=UTF-8 -jar target/app.jar"
+        );
         // build_cmd 用 -f pom.xml
         assert_eq!(
             schemes[0].build_cmd.as_deref(),
@@ -1781,7 +1794,7 @@ public class Helper {
         // start_cmd 用全路径 java
         assert_eq!(
             schemes[0].start_cmd,
-            "\"C:\\JAVA\\jdk-21.0.11\\bin\\java.exe\" -jar target/app.jar"
+            "\"C:\\JAVA\\jdk-21.0.11\\bin\\java.exe\" -Dfile.encoding=UTF-8 -jar target/app.jar"
         );
         // build_cmd 前缀 set JAVA_HOME
         assert!(schemes[0]
@@ -1881,7 +1894,7 @@ public class Helper {
         // start_cmd 用 target/（无子目录前缀）
         assert!(detected[0].schemes[0]
             .start_cmd
-            .contains("java -jar target/"));
+            .contains("java -Dfile.encoding=UTF-8 -jar target/"));
     }
 
     #[tokio::test]
@@ -2175,7 +2188,7 @@ public class Main {
         assert_eq!(detected[0].expected_ports, vec!["7000".to_string()]);
         assert!(detected[0].schemes[0]
             .start_cmd
-            .contains("java -jar cli/target/"));
+            .contains("java -Dfile.encoding=UTF-8 -jar cli/target/"));
     }
 
     #[tokio::test]
