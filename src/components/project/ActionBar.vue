@@ -107,7 +107,8 @@ const buildFailed = computed(
       </template>
       构建
     </NButton>
-    <NButton size="tiny" tertiary :disabled="busy" @click="emit('log')">日志</NButton>
+    <!-- 日志只是路由跳转，与启停无冲突；重启卡在构建阶段时更需要看构建日志诊断 -->
+    <NButton size="tiny" tertiary @click="emit('log')">日志</NButton>
     <NButton size="tiny" quaternary :disabled="busy" @click="emit('edit')">编辑</NButton>
     <NButton size="tiny" quaternary type="error" :disabled="busy" @click="emit('delete')">
       删除
