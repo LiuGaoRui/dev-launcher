@@ -20,12 +20,24 @@ import { safeCall } from '@/api/invoke'
 const { message } = createDiscreteApi(['message'])
 
 export const useLogStore = defineStore('log', () => {
-  /** 累积的日志文本（实时追加，仅属于当前活跃订阅） */
+  /** 累积的日志文本（实时追加，仅属于当前活跃订阅，超过 MAX_LINES 行 / MAX_CHARS 字符截断头部） */
   const lines = ref('')
+  /** 当前行数（增量维护；语义与「非空文本 = 换行符数 + 1」一致） */
+  const lineCount = ref(0)
   /** 是否加载中（首次订阅） */
   const loading = ref(false)
   /** 当前订阅的日志类型 */
   const currentType = ref<LogType>('start')
+
+  /** 缓冲上限（行）：超过后丢弃头部整行。全量日志在磁盘文件中，UI 仅保留尾部（ADR-007） */
+  const MAX_LINES = 5000
+  /**
+   * 缓冲硬上限（字符）：行数截断只对含换行符的输出生效，无换行的病态输出
+   * （如 \r 刷新的进度条、单行压缩文本）需此上限无视行对齐兜底，否则缓冲
+   * 无界增长会撞上 128MB V8 old space 上限导致 renderer OOM。取值需满足
+   * 「正常 5000 行日志不触发」（约 10MB UTF-16，远低于 old space 上限）。
+   */
+  const MAX_CHARS = 5_000_000
 
   /** 订阅序号：每次 start/stop 递增，用于作废所有旧回调 */
   let seq = 0
@@ -36,6 +48,52 @@ export const useLogStore = defineStore('log', () => {
   /** 当前活跃订阅的项目 id / 类型（幂等判断用） */
   let activeProjectId: number | null = null
   let activeType: LogType | null = null
+
+  /**
+   * 追加一段日志并维持缓冲有界：先按行数截断（超过 MAX_LINES 行从头部丢弃
+   * 整行），再用字符硬上限兜底（无换行的病态输出）。行数增量维护，
+   * 避免每次推送 O(n) 全扫。
+   */
+  function appendChunk(text: string) {
+    if (!text) return
+    let next = lines.value + text
+    let newlines = 0
+    for (let i = text.indexOf('\n'); i !== -1; i = text.indexOf('\n', i + 1)) newlines++
+    let count = lines.value === '' ? newlines + 1 : lineCount.value + newlines
+    if (count > MAX_LINES) {
+      const drop = count - MAX_LINES
+      // 丢掉前 drop 行 = 连同第 drop 个换行符一起丢弃；找不齐换行符（超长无换行）则交给字符上限兜底
+      let idx = -1
+      for (let i = 0; i < drop; i++) {
+        const hit = next.indexOf('\n', idx + 1)
+        if (hit === -1) {
+          idx = -1
+          break
+        }
+        idx = hit
+      }
+      if (idx !== -1) {
+        next = next.slice(idx + 1)
+        count -= drop
+      }
+    }
+    if (next.length > MAX_CHARS) {
+      // 字符兜底：无视行对齐保留尾部 MAX_CHARS 字符，行数按丢弃段内的换行符数扣减
+      const cut = next.length - MAX_CHARS
+      let dropped = 0
+      for (let i = next.indexOf('\n'); i !== -1 && i < cut; i = next.indexOf('\n', i + 1)) dropped++
+      next = next.slice(cut)
+      count -= dropped
+    }
+    lines.value = next
+    lineCount.value = count
+  }
+
+  /** 清空本地缓冲（订阅切换 / 清空日志 / 重置时） */
+  function resetBuffer() {
+    lines.value = ''
+    lineCount.value = 0
+  }
 
   /**
    * 开始实时订阅某项目指定类型的日志。
@@ -52,7 +110,7 @@ export const useLogStore = defineStore('log', () => {
     activeProjectId = projectId
     activeType = logType
     currentType.value = logType
-    lines.value = ''
+    resetBuffer()
     loading.value = true
 
     const channel = new Channel<LogChunk>()
@@ -61,7 +119,7 @@ export const useLogStore = defineStore('log', () => {
       // sub_id 尚未返回时放行（后端从 offset 0 推送的首批内容早于 invoke 返回）。
       if (activeToken !== myToken) return
       if (activeSubId !== null && chunk.sub_id !== activeSubId) return
-      lines.value += chunk.text
+      appendChunk(chunk.text)
     }
 
     const [subId, err] = await safeCall(() => subscribeLog(projectId, logType, channel))
@@ -114,7 +172,7 @@ export const useLogStore = defineStore('log', () => {
     }
     // 仅当清空的正是当前展示的日志时同步清本地缓冲
     if (activeProjectId === projectId && activeType === logType) {
-      lines.value = ''
+      resetBuffer()
     }
     return true
   }
@@ -122,13 +180,14 @@ export const useLogStore = defineStore('log', () => {
   /** 重置全部状态（离开详情页时调用） */
   function reset() {
     stopLive()
-    lines.value = ''
+    resetBuffer()
     loading.value = false
     currentType.value = 'start'
   }
 
   return {
     lines,
+    lineCount,
     loading,
     currentType,
     startLive,

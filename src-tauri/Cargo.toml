@@ -44,6 +44,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
+# WebView2 COM 接口（MemoryUsageTargetLevel 失焦降内存，ADR-007）。
+# 版本须与 wry 0.55 传递依赖的 webview2-com（0.38.x）对齐，避免双版本。
+# windows-core 锁 0.61：Interface/cast 的 trait 必须与 webview2-com-sys 0.38
+# 所用同一份（lock 中另存 0.57/0.58，属于别的包，不可混用）。
+webview2-com = "0.38"
+windows-core = "0.61"
 # windows crate features:
 # - Win32_Foundation: HANDLE / CloseHandle
 # - Win32_Security: CreateJobObjectW 的 SECURITY_ATTRIBUTES 参数（即便传 None 也需此 feature）

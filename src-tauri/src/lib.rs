@@ -10,6 +10,7 @@ mod models;
 mod process;
 mod services;
 mod state;
+mod webview_tuning;
 
 use tauri::Manager;
 use state::AppState;
@@ -37,6 +38,12 @@ pub fn run() {
             let state = AppState::new(app.handle())?;
             app.manage(state);
             Ok(())
+        })
+        // 失焦降内存 / 聚焦恢复（ADR-007）
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Focused(focused) = event {
+                webview_tuning::on_focus_change(window, *focused);
+            }
         })
         .invoke_handler(tauri::generate_handler![
             // project

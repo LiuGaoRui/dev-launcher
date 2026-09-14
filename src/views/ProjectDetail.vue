@@ -110,17 +110,6 @@ async function handleClear() {
 function goBack() {
   router.back()
 }
-
-/** 行数统计（仅展示用） */
-const lineCount = computed(() => {
-  const t = logStore.lines
-  if (!t) return 0
-  let n = 1
-  for (let i = 0; i < t.length; i++) {
-    if (t.charCodeAt(i) === 10) n++
-  }
-  return n
-})
 </script>
 
 <template>
@@ -179,7 +168,7 @@ const lineCount = computed(() => {
           </NRadioGroup>
 
           <div class="log-actions">
-            <span class="line-count">{{ lineCount }} 行</span>
+            <span class="line-count">{{ logStore.lineCount }} 行</span>
             <NButton size="small" tertiary @click="handleClear">
               清空
             </NButton>
